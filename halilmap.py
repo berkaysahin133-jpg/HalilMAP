@@ -1,4 +1,5 @@
 import sys
+import ast
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLineEdit, QPushButton, QComboBox, QTabWidget, QTextEdit,
@@ -222,13 +223,26 @@ class HalilMAP(QMainWindow):
         self.populate_scans(result)
         self.populate_hosts(result)
         self.populate_services(result)
-        self.scan_result_data = eval(result)
+        self.scan_result_data = self.safe_eval(result)
         self.scan_button.setEnabled(True)
         self.cancel_button.setEnabled(False)
 
-    def format_scan_result(self,result):
+    def safe_eval(self, result):
+        """Güvenli şekilde string'i Python objesine çevir"""
         try:
-            nmap_data = eval(result)
+            return ast.literal_eval(result)
+        except:
+            try:
+                # JSON formatına dönüştürmeyi dene
+                import json
+                json_str = result.replace("'", '"')
+                return json.loads(json_str)
+            except:
+                return {}
+
+    def format_scan_result(self, result):
+        try:
+            nmap_data = self.safe_eval(result)
             scan_info = nmap_data.get('nmap', {})
             scan_stats = scan_info.get('scanstats', {})
             scanned_hosts = nmap_data.get('scan', {})
@@ -263,7 +277,7 @@ class HalilMAP(QMainWindow):
 
     def populate_ports_hosts(self, result):
         try:
-            nmap_data = eval(result)
+            nmap_data = self.safe_eval(result)
             scanned_hosts = nmap_data.get('scan', {})
             content = ""
 
@@ -278,7 +292,7 @@ class HalilMAP(QMainWindow):
 
     def populate_topology(self, result):
         try:
-            nmap_data = eval(result)
+            nmap_data = self.safe_eval(result)
             scanned_hosts = nmap_data.get('scan', {})
             content = "Topology Information:\n\n"
 
@@ -294,7 +308,7 @@ class HalilMAP(QMainWindow):
 
     def populate_host_details(self, result):
         try:
-            nmap_data = eval(result)
+            nmap_data = self.safe_eval(result)
             scanned_hosts = nmap_data.get('scan', {})
             content = "Host Details:\n\n"
 
@@ -312,7 +326,7 @@ class HalilMAP(QMainWindow):
 
     def populate_scans(self, result):
         try:
-            nmap_data = eval(result)
+            nmap_data = self.safe_eval(result)
             scan_info = nmap_data.get('nmap', {})
             scan_stats = scan_info.get('scanstats', {})
             content = "Scan Information:\n\n"
@@ -330,7 +344,7 @@ class HalilMAP(QMainWindow):
 
     def populate_hosts(self, result):
         try:
-            nmap_data = eval(result)
+            nmap_data = self.safe_eval(result)
             scanned_hosts = nmap_data.get('scan', {})
 
             self.hosts_list.clear()
@@ -343,7 +357,7 @@ class HalilMAP(QMainWindow):
 
     def populate_services(self, result):
         try:
-            nmap_data = eval(result)
+            nmap_data = self.safe_eval(result)
             scanned_hosts = nmap_data.get('scan', {})
 
             self.services_list.clear()
@@ -360,6 +374,9 @@ class HalilMAP(QMainWindow):
     def filter_hosts(self):
         try:
             filter_text = self.target_input.text().strip()
+            if not hasattr(self, 'scan_result_data'):
+                return
+                
             nmap_data = self.scan_result_data
             scanned_hosts = nmap_data.get('scan', {})
 
