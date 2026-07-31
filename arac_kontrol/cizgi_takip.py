@@ -1,549 +1,560 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-RoboVizyon - Cizgi Takip + QR Gorev Protokolu   (Raspberry Pi 5 + Arduino/MCP4725)
+RoboVizyon - Cizgi Takip + QR Gorev Protokolu   (Raspberry Pi 5)
 
-v2 goruntu isleme:
-  - Yatay bant (ROI) tabanli centroid: yakin bant direksiyonu surer,
-    uzak bant on-gorus (feed-forward) ve hiz azaltma icin kullanilir
-  - Otsu ile uyarlanabilir esik (sabit 0-85 esigi kaldirildi) + kararlilik filtresi
-  - CAP_PROP_BUFFERSIZE=1 -> kamera gecikmesi (PID'in en buyuk dusmani) yok edildi
-  - time.monotonic() -> NTP saat sicramasi PID'i patlatmaz
-  - Turev filtresi + kosullu integrasyon (anti-windup)
-  - Egrilige gore otomatik yavaslama
-  - QR: sadece icerik dogrulanirsa manevra tetiklenir (yanlis 90 donus riski kalkti)
-  - Pivot dahil HER karede waitKey -> 'q' her an calisir
-  - try/finally + atexit: hangi hatada olursa olsun motorlar notre iner
+Takimin calisan kodu + hedefli duzeltmeler. Yapisi, durum isimleri ve
+ayar mantigi AYNEN korundu; sadece asagidaki [FIX] noktalari degisti.
+Her degisiklik "# [FIX n]" ile isaretli, diff almak kolay olsun diye.
 
-Kullanim:
-    python3 cizgi_takip.py                 # pencereli
-    python3 cizgi_takip.py --headless      # SSH/servis
-    python3 cizgi_takip.py --kalibre       # esik/ROI ayar modu, motor gonderilmez
+[FIX 0]  YON bayragi        : Kodda iki zit yon konvansiyonu vardi.
+                              "SAGA_PIVOT=(2730,1320)" yuksek=ileri diyordu,
+                              "NORMAL_SEYIR_HIZI=1550 / MAX_HIZ_SINIRI=2350
+                              (ters tork)" ise dusuk=ileri diyordu. Ikisi ayni
+                              anda dogru olamaz -> donusten sonra cizgi kayboluyordu.
+                              Artik her sey notre gore OFSET olarak yazili,
+                              tek YON bayragi ile isaret cevriliyor.
+[FIX 1]  Uyarlanabilir esik : Sabit inRange(0,85) yerine Otsu. Donunce kamera
+                              baska isiga bakinca cizgi kayboluyordu.
+[FIX 2]  DOKSAN_DERECE_SAG  : Acik cevrim 0.7 sn -> KAPALI CEVRIM. Cizgi
+                              ortalaninca biter, sure sadece ust sinir.
+[FIX 3]  CIZGI_DOGRULA      : Yerinde durup bakmak yerine YAVAS DONEREK arar.
+                              Ayrica tam cozunurluk yerine ayni 160x120 hatti
+                              ve alt ROI kullanir (tum kare, QR'in kendi siyahini
+                              "cizgi" saniyordu).
+[FIX 4]  cx_tam / bbox init : M_tam["m00"]==0 oldugunda tanimsiz/bayat degerle
+                              devam ediliyordu.
+[FIX 5]  waitKey            : Dongunun basina alindi -> pivot/QR durumlarinda da
+                              'q' calisir (continue'lar yuzunden olu kalmisti).
+[FIX 6]  time.monotonic     : Pi 5'te RTC yok; NTP senkronu time.time()'i geri
+                              sicratip dt'yi negatife dusurebiliyor -> turev patlar.
+[FIX 7]  Seri akis kontrolu : Yazma hiz siniri + Arduino heartbeat'inin okunup
+                              bosaltilmasi (RX birikirse bayat komut uygulanir).
+
+ONEMLI: arduino_dac_surucu.ino'yu da yukle. Eski firmware'deki Serial.parseInt()
+1000 ms timeout ile loop'u kilitliyor; yarim paket gelirse watchdog o sure
+boyunca calisamiyor ve arac son komutla donmeye devam ediyor (asiri donus).
 """
 
-import argparse
-import atexit
-import glob
-import sys
 import time
 
 import cv2
 import numpy as np
 import serial
+from pyzbar.pyzbar import decode
 
+# =============================================================================
+# 1. SERİ PORT BAĞLANTISI
+# =============================================================================
 try:
-    from pyzbar.pyzbar import decode as qr_decode
-except ImportError:
-    qr_decode = None
+    arduino = serial.Serial('/dev/ttyUSB0', 115200, timeout=0.05, write_timeout=0.05)
+    print("[SİSTEM] Arduino bağlantısı başarılı. Senkronize takip başlıyor!")
+    time.sleep(2)
+    arduino.reset_input_buffer()
+    arduino.reset_output_buffer()
+except Exception as e:
+    print(f"[HATA] Seri port açılamadı: {e}")
+    exit()
+
+_son_gonderim = 0.0
+_son_paket = None
 
 
-# =============================================================================
-#  1. MOTOR KONVANSIYONU  --  ONCE BUNU DOGRULA
-# =============================================================================
-# Tekerlekleri havaya kaldir, sadece su satiri calistir:
-#     link.gonder(0.4, 0.4)
-# Ileri donuyorsa YON = +1 birak. Geri donuyorsa YON = -1 yap.
-#
-# NOT: Eski kodda TEMEL_HIZ=1550 idi. 1550, 2546'nin notre gore tam simetrigi;
-# yani arac seyir halinde GERI gidiyordu. Asagidaki normalize sistem bu hatanin
-# tekrarlanmasini imkansiz kilar: her sey -1.0..+1.0 arasinda ifade edilir.
-
-NOTR = 2048          # DAC 2048 = 2.5 V = tam durus
-SPAN = 900           # notr'dan tam gaza DAC farki (2048 +/- 900 -> 1148..2948)
-YON  = +1            # +1: DAC > NOTR ileri    |    -1: DAC < NOTR ileri
-
-
-# =============================================================================
-#  2. AYARLAR
-# =============================================================================
-SERI_PORT_ADAYLARI = ["/dev/ttyUSB*", "/dev/ttyACM*"]
-BAUD               = 115200
-
-KAM_W, KAM_H  = 320, 240
-ISLEM_W       = 160          # cizgi analizi bu genislikte yapilir (hiz icin)
-ISLEM_H       = 120
-
-# --- Yatay bantlar (ISLEM_H uzerinden, 0 = ust) ---
-# yakin bant = direksiyon, uzak bant = on-gorus
-BANT_YAKIN = (0.72, 0.98)    # kareye en yakin serit
-BANT_ORTA  = (0.46, 0.70)
-BANT_UZAK  = (0.20, 0.44)
-
-# --- Hiz (normalize, 0..1) ---
-HIZ_SEYIR   = 0.55           # duz yolda
-HIZ_MIN     = 0.22           # keskin virajda inilecek taban
-HIZ_QR      = 0.28           # QR'a yaklasirken
-PIVOT_HIZ   = 0.90           # yerinde donus
-
-# --- PID (normalize hata: -1.0 .. +1.0) ---
-Kp        = 0.85
-Ki        = 0.12
-Kd        = 0.045
-D_FILTRE  = 0.35             # turev alcak geciren katsayisi (0=kapali, 1=cok agir)
-I_SINIR   = 0.35             # integral katkisinin mutlak tavani
-FF_KAZANC = 0.30             # uzak banttan gelen on-gorus katkisi
-
-YAVASLAMA = 0.75             # |direksiyon| basina hiz kesme orani
-
-# --- Kose (L-viraj) tespiti ---
-KOSE_CX_ESIK   = 0.34        # yakin bant centroid'i merkezden bu kadar kacarsa
-KOSE_EN_BOY    = 2.6         # yakin bant konturu bu kadar yassiysa = yan cizgi
-KOSE_CIKIS     = 0.12        # pivot cikisi: cx merkeze bu kadar yaklasinca
-KOSE_MAX_SURE  = 2.5         # pivot bu sureyi asarsa guvenli durusa gec
-
-# --- QR ---
-QR_ICERIK       = "11"       # sadece bu icerik 90 sag donusu tetikler
-QR_TARAMA_ARASI = 3          # her N karede bir pyzbar cagrilir
-QR_SOGUMA       = 3.0        # ayni QR'i tekrar okumama suresi (sn)
-DONUS_SURESI    = 1.4        # 90 pivot ust siniri (cizgi bulununca erken biter)
-
-# --- Guvenlik ---
-KOMUT_PERIYOT   = 0.02       # Arduino'ya en fazla 50 Hz (watchdog 250 ms)
-CIZGI_KAYIP_SUR = 0.8        # bu kadar cizgi yoksa dur
-
-
-# =============================================================================
-#  3. MOTOR BAGLANTISI
-# =============================================================================
-class MotorLink:
-    """Arduino'ya <sol,sag> paketi basar. Kapanista her kosulda notre iner."""
-
-    def __init__(self, port=None, kuru=False):
-        self.kuru = kuru                 # True -> seri port acilmaz (kalibre modu)
-        self.ser = None
-        self._son_gonderim = 0.0
-        self._son_paket = None
-        self.son_heartbeat = time.monotonic()
-
-        if kuru:
-            print("[SISTEM] Kalibrasyon modu: motorlara komut gonderilmiyor.")
-            return
-
-        port = port or self._port_bul()
-        if port is None:
-            raise RuntimeError("Arduino bulunamadi (/dev/ttyUSB* veya /dev/ttyACM*)")
-
-        self.ser = serial.Serial(port, BAUD, timeout=0, write_timeout=0.05)
-        print(f"[SISTEM] Arduino baglandi: {port}")
-        time.sleep(2.0)                  # DTR reset'i bekle
-        self.ser.reset_input_buffer()
-        self.ser.reset_output_buffer()
-
-    @staticmethod
-    def _port_bul():
-        for kalip in SERI_PORT_ADAYLARI:
-            bulunan = sorted(glob.glob(kalip))
-            if bulunan:
-                return bulunan[0]
-        return None
-
-    @staticmethod
-    def _dac(u):
-        """u: -1.0 (tam geri) .. +1.0 (tam ileri)  ->  DAC 0..4095"""
-        u = float(np.clip(u, -1.0, 1.0))
-        return int(round(np.clip(NOTR + YON * SPAN * u, 0, 4095)))
-
-    def gonder(self, u_sol, u_sag, zorla=False):
-        """Normalize hizlari yollar. Ayni paket tekrar tekrar spam edilmez."""
-        paket = (self._dac(u_sol), self._dac(u_sag))
-        simdi = time.monotonic()
-
-        # Degismediyse yine de watchdog'u beslemek icin periyodik tekrar sart
-        if not zorla and paket == self._son_paket and \
-           (simdi - self._son_gonderim) < KOMUT_PERIYOT:
-            return
-
-        self._son_paket = paket
-        self._son_gonderim = simdi
-
-        if self.kuru or self.ser is None:
-            return
-        try:
-            self.ser.write(f"<{paket[0]},{paket[1]}>\n".encode("ascii"))
-        except serial.SerialException as e:
-            print(f"[HATA] Seri yazma: {e}")
-
-    def dur(self):
-        self.gonder(0.0, 0.0, zorla=True)
-
-    def heartbeat_oku(self):
-        """Arduino'dan gelen OK satirlarini yutar, canlilik zamanini gunceller."""
-        if self.kuru or self.ser is None:
-            return
-        try:
-            if self.ser.in_waiting:
-                self.ser.read(self.ser.in_waiting)
-                self.son_heartbeat = time.monotonic()
-        except serial.SerialException:
-            pass
-
-    def kapat(self):
-        try:
-            self.dur()
-            time.sleep(0.1)
-            self.dur()
-        finally:
-            if self.ser is not None and self.ser.is_open:
-                self.ser.close()
-                self.ser = None
-
-
-# =============================================================================
-#  4. PID
-# =============================================================================
-class PID:
-    def __init__(self, kp, ki, kd, i_sinir, d_filtre):
-        self.kp, self.ki, self.kd = kp, ki, kd
-        self.i_sinir, self.d_filtre = i_sinir, d_filtre
-        self.sifirla()
-
-    def sifirla(self):
-        self.integral = 0.0
-        self.onceki_hata = 0.0
-        self.turev_f = 0.0
-
-    def hesapla(self, hata, dt):
-        p = self.kp * hata
-
-        # Turev: filtreli (dt jitter'inin Kd ile buyumesini engeller)
-        ham_turev = (hata - self.onceki_hata) / dt if dt > 1e-4 else 0.0
-        self.turev_f += self.d_filtre * (ham_turev - self.turev_f)
-        d = self.kd * self.turev_f
-        self.onceki_hata = hata
-
-        # Integral: kosullu (cikis doymussa ve ayni yone itiyorsa biriktirme)
-        aday = self.integral + hata * dt
-        i = self.ki * aday
-        if abs(i) < self.i_sinir or (i * hata) < 0:
-            self.integral = aday
-        i = float(np.clip(self.ki * self.integral, -self.i_sinir, self.i_sinir))
-
-        return p + i + d
-
-
-# =============================================================================
-#  5. SERIT DEDEKTORU
-# =============================================================================
-class BantOlcum:
-    __slots__ = ("gecerli", "cx", "alan", "en_boy", "maske")
-
-    def __init__(self, gecerli=False, cx=0.0, alan=0.0, en_boy=0.0, maske=None):
-        self.gecerli = gecerli
-        self.cx = cx              # -1.0 (tam sol) .. +1.0 (tam sag)
-        self.alan = alan          # piksel
-        self.en_boy = en_boy      # w/h
-        self.maske = maske
-
-
-class SeritDedektoru:
-    """Otsu tabanli, bant bant calisan siyah cizgi bulucu."""
-
-    ESIK_TABAN, ESIK_TAVAN = 35, 135     # Otsu'nun kacmasina izin verilen aralik
-    KOYU_ORAN_MIN, KOYU_ORAN_MAX = 0.01, 0.55
-    MIN_ALAN = 60
-
-    def __init__(self, w, h):
-        self.w, self.h = w, h
-        self.esik_f = 85.0               # kareler arasi yumusatilmis esik
-
-    def _bant(self, gray, aralik):
-        y0 = int(self.h * aralik[0])
-        y1 = int(self.h * aralik[1])
-        return gray[y0:y1, :], y0
-
-    def _esik_guncelle(self, roi):
-        """Otsu esigini hesapla, mantikli araliga kilitle, kareler arasi yumusat."""
-        otsu, _ = cv2.threshold(roi, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        otsu = float(np.clip(otsu, self.ESIK_TABAN, self.ESIK_TAVAN))
-        self.esik_f += 0.25 * (otsu - self.esik_f)
-        return self.esik_f
-
-    def olc(self, gray, aralik, esik=None):
-        roi, _ = self._bant(gray, aralik)
-        if roi.size == 0:
-            return BantOlcum()
-
-        roi = cv2.GaussianBlur(roi, (5, 5), 0)
-        if esik is None:
-            esik = self._esik_guncelle(roi)
-
-        maske = cv2.inRange(roi, 0, int(esik))
-        maske = cv2.morphologyEx(maske, cv2.MORPH_OPEN,
-                                 cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
-
-        # Bant tamamen koyu (golge/kapali kamera) veya bombos ise guvenme
-        koyu_oran = float(np.count_nonzero(maske)) / maske.size
-        if not (self.KOYU_ORAN_MIN <= koyu_oran <= self.KOYU_ORAN_MAX):
-            return BantOlcum(maske=maske)
-
-        konturlar, _ = cv2.findContours(maske, cv2.RETR_EXTERNAL,
-                                        cv2.CHAIN_APPROX_SIMPLE)
-        if not konturlar:
-            return BantOlcum(maske=maske)
-
-        c = max(konturlar, key=cv2.contourArea)
-        alan = cv2.contourArea(c)
-        if alan < self.MIN_ALAN:
-            return BantOlcum(maske=maske)
-
-        M = cv2.moments(c)
-        if M["m00"] == 0:
-            return BantOlcum(maske=maske)
-
-        cx_px = M["m10"] / M["m00"]
-        cx_n = (cx_px - self.w / 2.0) / (self.w / 2.0)     # -1..+1
-
-        _, _, bw, bh = cv2.boundingRect(c)
-        en_boy = bw / float(bh) if bh > 0 else 99.0
-
-        return BantOlcum(True, float(np.clip(cx_n, -1, 1)), alan, en_boy, maske)
-
-
-# =============================================================================
-#  6. QR
-# =============================================================================
-def qr_ara(gray_tam):
-    """Tam karede QR arar, bulunan icerikleri liste olarak doner."""
-    if qr_decode is None:
-        return []
-    # Kontrasti ac -- salon isigi parlamasi QR pikselini yutuyordu
-    net = cv2.normalize(gray_tam, None, 0, 255, cv2.NORM_MINMAX)
+def motor_sur(sol_dac, sag_dac, zorla=False):
+    """Arduino'ya <Sol,Sag> DAC paketini iletir."""
+    # [FIX 7] Aynı paketi kamera hızında spam etmek Arduino RX buffer'ını
+    # doldurup bayat komut uygulanmasına yol açıyordu. 50 Hz yeterli
+    # (firmware watchdog'u 250 ms).
+    global _son_gonderim, _son_paket
+    paket = (int(np.clip(sol_dac, 0, 4095)), int(np.clip(sag_dac, 0, 4095)))
+    simdi = time.monotonic()
+    if not zorla and paket == _son_paket and (simdi - _son_gonderim) < 0.02:
+        return
+    _son_paket, _son_gonderim = paket, simdi
     try:
-        return [o.data.decode("utf-8", errors="ignore") for o in qr_decode(net)]
-    except Exception:
-        return []
+        arduino.write(f"<{paket[0]},{paket[1]}>\n".encode('utf-8'))
+    except serial.SerialException as e:
+        print(f"[HATA] Seri yazma: {e}")
 
 
-# =============================================================================
-#  7. KAMERA
-# =============================================================================
-def kamera_ac():
-    cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
-    if not cap.isOpened():
-        cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        raise RuntimeError("Kamera acilamadi")
-
-    # MJPG: USB bant genisligini dusurur, yuksek FPS'i mumkun kilar
-    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, KAM_W)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, KAM_H)
-    cap.set(cv2.CAP_PROP_FPS, 60)
-
-    # EN KRITIK SATIR: V4L2 varsayilan 4 kare biriktirir -> ~100 ms olu zaman.
-    # PID bunu gorunce salinir. 1 yaparak her zaman en taze kareyi aliriz.
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-    # Otomatik pozlama QR piksellerini bulandiriyor -> manuel, kisa perde
+def arduino_dinle():
+    """[FIX 7] Firmware'in 'OK,sol,sag' heartbeat'ini yutar, RX birikmesin."""
     try:
-        cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)   # V4L2 manuel mod
-        cap.set(cv2.CAP_PROP_EXPOSURE, 60)          # birim 100us -> ~6 ms
-        cap.set(cv2.CAP_PROP_GAIN, 0)
-        cap.set(cv2.CAP_PROP_AUTO_WB, 0)
-    except Exception:
+        if arduino.in_waiting:
+            arduino.read(arduino.in_waiting)
+    except serial.SerialException:
         pass
 
-    return cap
+
+# =============================================================================
+# 2. HIZ, TORK VE KİNEMATİK AYARLAR (BURADAN AYARLAYACAKSIN!)
+# =============================================================================
+NOTR = 2048  # Tam duruş noktası (2.50V)
+
+# --- [FIX 0] YÖN KONVANSİYONU -- ÖNCE BUNU DOĞRULA -------------------------
+# Tekerlekler HAVADAYKEN:  motor_sur(NOTR + 500, NOTR + 500)
+#   İleri döndü -> YON = +1   (varsayılan)
+#   Geri  döndü -> YON = -1
+# Aşağıdaki her şey nötre göre OFSET; YON tek başına tüm yönleri çevirir.
+YON = +1
+
+# Ofsetler (senin çalışan değerlerinin nötre uzaklığı, korundu)
+OFS_NORMAL   = 500   # eski 1550/2548
+OFS_DUZELTME = 428   # eski 1620/2476
+OFS_QR_YAVAS = 400   # eski 1650/2448
+OFS_PIVOT    = 700   # eski 1320/2730 -> simetrik hale getirildi
+OFS_MAX_ILERI = 970  # PID'in çıkabileceği en yüksek ileri güç
+OFS_MAX_TERS  = 300  # iç tekerleğe izin verilen ters tork (fren etkisi)
+
+
+def ileri(ofset):
+    """Nötre göre ofseti gerçek DAC değerine çevirir (ileri yön)."""
+    return int(np.clip(NOTR + YON * ofset, 0, 4095))
+
+
+def geri(ofset):
+    return int(np.clip(NOTR - YON * ofset, 0, 4095))
+
+
+NORMAL_SEYIR_HIZI   = ileri(OFS_NORMAL)     # Çizgi ortadayken hızlı seyir
+DUZELTME_SEYIR_HIZI = ileri(OFS_DUZELTME)   # Sapınca tork kaybetmeden ortala
+QR_YAKLASMA_HIZI    = ileri(OFS_QR_YAVAS)
+HATA_ESIGI = 12  # Bu piksel sapmasının üstü düzeltme hızına geçer
+
+# Kamera burnun önünde olduğu için tekerlekler köşeye gelene kadar düz gitme süresi:
+VIRAJ_ILERI_SURESI = 0.6  # 0.4 - 1.0 sn arası test ederek en iyi konumu bul!
+
+# --- PİVOT DÖNÜŞ GÜÇLERİ ---
+# [FIX 0] Artık YON'dan türetiliyor; ayrıca simetrik (eskisi -728/+672 idi,
+# asimetri dönerken aracı yana kaydırıyordu).
+SOLA_PIVOT = (geri(OFS_PIVOT), ileri(OFS_PIVOT))   # sol geri, sağ ileri
+SAGA_PIVOT = (ileri(OFS_PIVOT), geri(OFS_PIVOT))   # sol ileri, sağ geri
+
+# Arama sırasında kullanılan yavaş pivot (çizgiyi atlamamak için)
+ARAMA_SOL = (geri(int(OFS_PIVOT * 0.55)), ileri(int(OFS_PIVOT * 0.55)))
+ARAMA_SAG = (ileri(int(OFS_PIVOT * 0.55)), geri(int(OFS_PIVOT * 0.55)))
+
+DONUS_SURESI_90_DEG = 1.5   # [FIX 2] artık ÜST SINIR; çizgi ortalanınca erken biter
+QR_PIVOT_MIN_SURE   = 0.35  # bu süreden önce "çizgi bulundu" sayma (eski çizgi hâlâ kadrajda)
+
+# Standart PID Katsayıları
+Kp = 5.8
+Ki = 0.01
+Kd = 4.0
+K_ACI = 0.85  # Çapraz çizgi açı telafi katsayısı (Stanley Look-Ahead)
+
+# [FIX 0] Eski MIN_HIZ_SINIRI / MAX_HIZ_SINIRI kaldırıldı. Kırpma artık ofset
+# uzayında (-OFS_MAX_TERS .. +OFS_MAX_ILERI) yapılıyor; böylece YON çevrilince
+# sınırlar da otomatik doğru tarafa geçiyor. Ham DAC sınırı yazmak, yönü
+# çevirdiğinde sessizce yanlış tarafı kırpıyordu.
+# =============================================================================
+
+# PID Hafıza Değişkenleri
+son_hata = 0
+toplam_hata = 0
+son_zaman = time.monotonic()          # [FIX 6]
+son_kaybolma_yonu = "SOL"
+
+# Durum Makinesi Değişkenleri
+DURUM = "CIZGI_TAKIP"
+fren_zamanlayici = 0
+donus_zamanlayici = 0
+viraj_zamanlayici = 0
+qr_bekleme_sure = 0
+kurtarma_zamanlayici = 0
+dogrula_yonu = "SAG"                  # [FIX 3] arama hangi yöne dönerek yapılacak
+
+# [FIX 1] Uyarlanabilir eşik hafızası
+esik_f = 85.0
+esik_ilk = True                       # [FIX 1b] ilk karede yumuşatmadan otur
+ESIK_TABAN, ESIK_TAVAN = 35, 135
+KOYU_ORAN_MIN, KOYU_ORAN_MAX = 0.01, 0.55
 
 
 # =============================================================================
-#  8. ANA DONGU
+# 3. GÖRÜNTÜ İŞLEME YARDIMCILARI
 # =============================================================================
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--headless", action="store_true", help="pencere acma")
-    ap.add_argument("--kalibre", action="store_true", help="motor gonderme, sadece goruntu")
-    ap.add_argument("--port", default=None)
-    args = ap.parse_args()
+def esik_guncelle(gray_img):
+    """[FIX 1] Otsu ile eşik bul, mantıklı aralığa kilitle, kareler arası yumuşat.
 
-    goster = not args.headless
+    Sabit 0-85 eşiği, araç dönüp kamera farklı aydınlatmaya baktığında
+    çizgiyi tamamen kaybediyordu. Otsu her karede zemin/çizgi ayrımını
+    kendisi bulur; aralık kilidi de gölge/parlama anlarında kaçmasını önler.
+    """
+    global esik_f, esik_ilk
+    o, _ = cv2.threshold(gray_img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    o = float(np.clip(o, ESIK_TABAN, ESIK_TAVAN))
+    if esik_ilk:
+        # [FIX 1b] Sabit 85'ten yumuşayarak gelmek, karanlık bir sahnede ilk
+        # birkaç karede TÜM görüntüyü "çizgi" yapıyordu (x=0, w=160 -> sahte
+        # L-viraj tetikleniyordu). İlk karede doğrudan Otsu'ya otur.
+        esik_f, esik_ilk = o, False
+    else:
+        esik_f += 0.25 * (o - esik_f)
+    return int(esik_f)
 
-    link = MotorLink(port=args.port, kuru=args.kalibre)
-    atexit.register(link.kapat)          # ne olursa olsun motorlar iner
 
-    cap = kamera_ac()
-    dedektor = SeritDedektoru(ISLEM_W, ISLEM_H)
-    pid = PID(Kp, Ki, Kd, I_SINIR, D_FILTRE)
+_kernel = np.ones((3, 3), np.uint8)
 
-    durum = "CIZGI_TAKIP"
-    t_durum = time.monotonic()
-    son_t = time.monotonic()
-    qr_soguma_bitis = 0.0
-    kare_no = 0
-    cizgi_son_gorulme = time.monotonic()
-    pivot_yon = 0                        # -1 sol, +1 sag
-    fps_f = 0.0
 
-    print("[SISTEM] Cizgi takip aktif. Cikis: 'q'")
+def cizgi_maskesi(frame_bgr):
+    """320x240 kareyi 160x120'ye küçültüp uyarlanabilir maske üretir."""
+    kucuk = cv2.resize(frame_bgr, (160, 120), interpolation=cv2.INTER_AREA)
+    gri = cv2.GaussianBlur(cv2.cvtColor(kucuk, cv2.COLOR_BGR2GRAY), (5, 5), 0)
+    esik = esik_guncelle(gri)
+    maske = cv2.inRange(gri, 0, esik)
+    maske = cv2.morphologyEx(maske, cv2.MORPH_OPEN, _kernel)
 
-    try:
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                print("[HATA] Kare alinamadi")
-                link.dur()
-                break
+    # [FIX 1c] Makullük kontrolü: kare tamamen koyuysa (gölge, kamera kapandı,
+    # pozlama patladı) veya bomboşsa maskeye GÜVENME. Bu koruma olmadan,
+    # tüm kareyi kaplayan bir maske x=0/w=160 üretip sahte L-viraj tetikliyor.
+    oran = float(np.count_nonzero(maske)) / maske.size
+    if not (KOYU_ORAN_MIN <= oran <= KOYU_ORAN_MAX):
+        return np.zeros_like(maske)
+    return maske
 
-            simdi = time.monotonic()
-            dt = simdi - son_t
-            son_t = simdi
-            dt = min(max(dt, 1e-3), 0.2)          # monotonic + guvenli klip
-            fps_f += 0.1 * ((1.0 / dt) - fps_f)
-            kare_no += 1
 
-            link.heartbeat_oku()
+def alt_roi_cx(maske, min_alan=80):
+    """[FIX 3] Alt şeritteki (araca en yakın) çizginin cx'i. Yoksa None.
 
-            kucuk = cv2.resize(frame, (ISLEM_W, ISLEM_H), interpolation=cv2.INTER_AREA)
-            gray = cv2.cvtColor(kucuk, cv2.COLOR_BGR2GRAY)
+    Tüm kare yerine alt ROI kullanmak şart: dönüş sırasında geldiğimiz eski
+    çizgi hâlâ kadrajın üstünde duruyor ve tüm-kare centroid'ini kaydırıyor.
+    """
+    roi = maske[80:120, :]
+    cnt, _ = cv2.findContours(roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnt:
+        return None
+    c = max(cnt, key=cv2.contourArea)
+    if cv2.contourArea(c) < min_alan:
+        return None
+    M = cv2.moments(c)
+    if M["m00"] == 0:
+        return None
+    return int(M['m10'] / M['m00'])
 
-            yakin = dedektor.olc(gray, BANT_YAKIN)
-            esik  = dedektor.esik_f
-            orta  = dedektor.olc(gray, BANT_ORTA, esik)
-            uzak  = dedektor.olc(gray, BANT_UZAK, esik)
 
-            if yakin.gecerli:
-                cizgi_son_gorulme = simdi
+# =============================================================================
+# 4. KAMERA VE ARABELLEK (BUFFER LAG) SENKRONİZASYONU
+# =============================================================================
+cap = cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
+cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Arabellek gecikmesini 1 kareye kilitler!
+cap.set(cv2.CAP_PROP_FPS, 30)
 
-            # ---------------- QR taramasi ----------------
-            if durum == "CIZGI_TAKIP" and simdi > qr_soguma_bitis \
-                    and kare_no % QR_TARAMA_ARASI == 0:
-                gray_tam = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                icerikler = qr_ara(gray_tam)
-                # ONEMLI: sadece dogrulanmis icerik manevra tetikler.
-                # Eski koddaki "kareye benzeyen kontur" refleksi kaldirildi;
-                # golge/bant/kavsak yuzunden yanlis 90 donus yapiyordu.
-                if QR_ICERIK in icerikler:
-                    print(f"[QR] '{QR_ICERIK}' dogrulandi -> kontrollu yavaslama")
-                    durum, t_durum = "QR_YAKLASIM", simdi
+try:
+    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+    cap.set(cv2.CAP_PROP_EXPOSURE, 120)
+    cap.set(cv2.CAP_PROP_GAIN, 0)
+except Exception:
+    pass
 
-            # =================== DURUM MAKINESI ===================
-            if durum == "QR_YAKLASIM":
-                link.gonder(HIZ_QR, HIZ_QR)
-                if simdi - t_durum > 0.25:
-                    durum, t_durum = "QR_FREN", simdi
 
-            elif durum == "QR_FREN":
-                link.dur()
-                if simdi - t_durum > 0.3:
-                    print(f"[PROTOKOL] 90 sag pivot (max {DONUS_SURESI} sn)")
-                    durum, t_durum = "PIVOT_QR", simdi
-                    pivot_yon = +1
+def taze_kare_al(kamera):
+    """Linux V4L2 arabellek gecikmesini önlemek için en taze kareyi çeker."""
+    kamera.grab()
+    ret_val, son_kare = kamera.retrieve()
+    return ret_val, son_kare
 
-            elif durum in ("PIVOT_QR", "PIVOT_SOL", "PIVOT_SAG"):
-                link.gonder(PIVOT_HIZ * pivot_yon, -PIVOT_HIZ * pivot_yon)
-                gecen = simdi - t_durum
-                ust_sinir = DONUS_SURESI if durum == "PIVOT_QR" else KOSE_MAX_SURE
 
-                # Kapali cevrim cikis: cizgi merkeze oturdugunda bitir.
-                # (Zamana dayali acik cevrim, aku dustukce aci tutturamiyordu.)
-                erken_bitis = (gecen > 0.35 and yakin.gecerli
-                               and abs(yakin.cx) < KOSE_CIKIS)
-                if erken_bitis or gecen > ust_sinir:
-                    link.dur()
-                    if erken_bitis:
-                        print(f"[PIVOT] Cizgi ortalandi ({gecen:.2f} sn) -> PID takip")
-                        durum = "CIZGI_TAKIP"
-                        pid.sifirla()
-                        qr_soguma_bitis = simdi + QR_SOGUMA
-                    else:
-                        print("[PIVOT] Sure doldu, cizgi yok -> guvenli durus")
-                        durum = "CIZGI_ARA"
-                    t_durum = simdi
+print(f"[SİSTEM] YON={YON:+d} | seyir={NORMAL_SEYIR_HIZI} | "
+      f"pivot sag={SAGA_PIVOT} sol={SOLA_PIVOT}")
+print("[SİSTEM] Kapalı çevrim QR dönüşü, uyarlanabilir eşik ve arama modu aktif.")
 
-            elif durum == "CIZGI_ARA":
-                link.dur()
-                if yakin.gecerli and abs(yakin.cx) < 0.5:
-                    print("[KURTARMA] Cizgi bulundu -> takip")
-                    durum = "CIZGI_TAKIP"
-                    pid.sifirla()
-                    qr_soguma_bitis = simdi + QR_SOGUMA
+try:
+    while True:
+        ret, frame = taze_kare_al(cap)
+        if not ret or frame is None:
+            print("[HATA] Kameradan görüntü alınamadı! Bağlantıyı kontrol edin.")
+            break
 
-            elif durum == "CIZGI_TAKIP":
-                if not yakin.gecerli:
-                    if simdi - cizgi_son_gorulme > CIZGI_KAYIP_SUR:
-                        print("[UYARI] Cizgi kayboldu -> durduruldu")
-                        link.dur()
-                        pid.sifirla()
-                        durum = "CIZGI_ARA"
-                    else:
-                        # Kisa kayiplarda son direksiyonu koruyarak yavas ilerle
-                        link.gonder(HIZ_MIN, HIZ_MIN)
-                else:
-                    # --- Kose (L-viraj) tespiti ---
-                    # Iki kanit: centroid uca kacti VE kontur yatay uzadi
-                    # (yassi kontur = cizgi yana donuyor demektir)
-                    kose = (abs(yakin.cx) > KOSE_CX_ESIK
-                            and yakin.en_boy > KOSE_EN_BOY
-                            and not uzak.gecerli)
-                    if kose:
-                        pivot_yon = +1 if yakin.cx > 0 else -1
-                        durum = "PIVOT_SAG" if pivot_yon > 0 else "PIVOT_SOL"
-                        t_durum = simdi
-                        print(f"[KESKIN KOSE] 90 {'sag' if pivot_yon>0 else 'sol'} pivot")
-                    else:
-                        # --- PID + on-gorus ---
-                        hata = yakin.cx
-                        direksiyon = pid.hesapla(hata, dt)
+        # [FIX 5] waitKey döngünün BAŞINDA. Eski kodda en alttaydı ve bütün
+        # manevra durumları 'continue' ile çıktığı için pivot boyunca 'q' ölüydü.
+        if (cv2.waitKey(1) & 0xff) == ord('q'):
+            print("[SİSTEM] 'q' tuşuna basıldı. Durduruluyor.")
+            break
 
-                        # Uzak bant nereye gidiyorsa oraya hafif on yatirim:
-                        # viraja girmeden once tekerlegi cevirmeye baslar
-                        if uzak.gecerli:
-                            direksiyon += FF_KAZANC * (uzak.cx - hata)
+        arduino_dinle()                                   # [FIX 7]
 
-                        direksiyon = float(np.clip(direksiyon, -1.0, 1.0))
+        su_an = time.monotonic()                          # [FIX 6]
+        dt = su_an - son_zaman
+        dt = min(dt, 0.1) if dt > 0 else 0.01
+        son_zaman = su_an
 
-                        # Egrilik arttikca yavasla (jilet gibi virajin siri)
-                        egrilik = abs(direksiyon)
-                        if orta.gecerli and uzak.gecerli:
-                            egrilik = max(egrilik, abs(uzak.cx - yakin.cx))
-                        hiz = HIZ_SEYIR * (1.0 - YAVASLAMA * min(1.0, egrilik))
-                        hiz = max(HIZ_MIN, hiz)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray_net = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
 
-                        u_sol = hiz + direksiyon
-                        u_sag = hiz - direksiyon
-
-                        # Diferansiyeli koruyarak normalize et (kirpma yerine olcekle)
-                        tepe = max(abs(u_sol), abs(u_sag), 1.0)
-                        link.gonder(u_sol / tepe, u_sag / tepe)
-
-            # ---------------- Gorsellestirme ----------------
-            if goster:
-                ciz = frame.copy()
-                olcek = KAM_W / float(ISLEM_W)
-                for ad, bant, olcum, renk in (
-                        ("YAKIN", BANT_YAKIN, yakin, (0, 0, 255)),
-                        ("ORTA",  BANT_ORTA,  orta,  (0, 200, 255)),
-                        ("UZAK",  BANT_UZAK,  uzak,  (0, 255, 0))):
-                    y0 = int(KAM_H * bant[0])
-                    y1 = int(KAM_H * bant[1])
-                    cv2.rectangle(ciz, (0, y0), (KAM_W - 1, y1), renk, 1)
-                    if olcum.gecerli:
-                        cx_px = int((olcum.cx * 0.5 + 0.5) * KAM_W)
-                        cv2.circle(ciz, (cx_px, (y0 + y1) // 2), 5, renk, -1)
-
-                cv2.line(ciz, (KAM_W // 2, 0), (KAM_W // 2, KAM_H), (255, 0, 0), 1)
-                cv2.putText(ciz, f"{durum}  esik={dedektor.esik_f:.0f}  {fps_f:4.1f}fps",
-                            (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1)
-                cv2.imshow("RoboVizyon - Cizgi Takip", ciz)
-                if yakin.maske is not None:
-                    cv2.imshow("Yakin Bant Maskesi", yakin.maske)
-
-                # waitKey HER karede cagriliyor: pivot sirasinda da 'q' calisir.
-                # Eski kodda tum manevra durumlari 'continue' ile ciktigi icin
-                # 1.4 sn'lik pivot boyunca klavyeden durdurmak mumkun degildi.
-                if (cv2.waitKey(1) & 0xFF) == ord("q"):
-                    print("[SISTEM] Kullanici durdurdu")
+        # =====================================================================
+        # PROTOKOL 1: QR KOD TARAMA VE DÖNÜŞ
+        # =====================================================================
+        if DURUM == "CIZGI_TAKIP" and su_an > qr_bekleme_sure:
+            for obj in decode(gray_net):
+                if obj.data.decode('utf-8') == "11":
+                    print("\n[QR TESPİTİ] '11' okundu! Kontrollü duruşa geçiliyor...")
+                    DURUM = "QR_YAKLASIM"
+                    fren_zamanlayici = su_an
+                    motor_sur(QR_YAKLASMA_HIZI, QR_YAKLASMA_HIZI)
                     break
 
-    except KeyboardInterrupt:
-        print("\n[SISTEM] Ctrl+C")
-    finally:
-        link.kapat()
-        cap.release()
-        if goster:
-            cv2.destroyAllWindows()
-        print("[SISTEM] Motorlar notrde, cikildi.")
+        if DURUM == "QR_YAKLASIM":
+            motor_sur(QR_YAKLASMA_HIZI, QR_YAKLASMA_HIZI)
+            if su_an - fren_zamanlayici > 0.2:
+                DURUM = "QR_GORULDU_FREN"
+                fren_zamanlayici = su_an
+                motor_sur(NOTR, NOTR)
+            continue
 
+        elif DURUM == "QR_GORULDU_FREN":
+            motor_sur(NOTR, NOTR)
+            if su_an - fren_zamanlayici > 0.3:
+                print("[PROTOKOL] 90° Sağa Dönüş başladı (çizgi ortalanınca bitecek)")
+                DURUM = "DOKSAN_DERECE_SAG"
+                donus_zamanlayici = su_an
+            continue
 
-if __name__ == "__main__":
-    sys.exit(main())
+        elif DURUM == "DOKSAN_DERECE_SAG":
+            # [FIX 2] KAPALI ÇEVRİM. Eskiden tam 0.7 sn körlemesine dönüp
+            # duruyordu; akü voltajı düştükçe ya eksik ya fazla dönüyor,
+            # sonra CIZGI_DOGRULA yerinde durup boş zemine bakıyordu.
+            # Şimdi L-viraj mantığının aynısı: çizgi merkeze oturunca bitir.
+            motor_sur(SAGA_PIVOT[0], SAGA_PIVOT[1])
+            mask = cizgi_maskesi(frame)
+            cx_alt = alt_roi_cx(mask)
+            gecen = su_an - donus_zamanlayici
+
+            if cx_alt is not None and 65 <= cx_alt <= 95 and gecen > QR_PIVOT_MIN_SURE:
+                print(f"[PROTOKOL] Çizgi ortalandı ({gecen:.2f} sn) -> takibe dönülüyor")
+                motor_sur(NOTR, NOTR)
+                DURUM = "CIZGI_YAKALANDI_FREN"
+                fren_zamanlayici = su_an
+                qr_bekleme_sure = su_an + 3.0
+            elif gecen >= DONUS_SURESI_90_DEG:
+                print("[PROTOKOL] Süre doldu, çizgi ortalanmadı -> aranıyor")
+                motor_sur(NOTR, NOTR)
+                DURUM = "CIZGI_DOGRULA"
+                dogrula_yonu = "SAG"
+                donus_zamanlayici = su_an
+            continue
+
+        elif DURUM == "CIZGI_DOGRULA":
+            # [FIX 3] Eskiden motor_sur(NOTR,NOTR) ile yerinde durup TAM
+            # ÇÖZÜNÜRLÜKLÜ tüm kareye bakıyordu. İki sorun vardı:
+            #   1) Duruyorsa çizgi kadraja hiç girmiyor -> asla bulamaz
+            #   2) Tüm kare + 150px eşiği, QR kodun kendi siyahını "çizgi" sayıyor
+            # Şimdi yavaşça dönerek arıyor ve alt ROI'ye bakıyor.
+            mask = cizgi_maskesi(frame)
+            cx_alt = alt_roi_cx(mask)
+
+            if cx_alt is not None and 55 <= cx_alt <= 105:
+                print("[BAŞARILI] Yerde çizgi bulundu! Takibe devam.")
+                motor_sur(NOTR, NOTR)
+                DURUM = "CIZGI_YAKALANDI_FREN"
+                fren_zamanlayici = su_an
+                qr_bekleme_sure = su_an + 3.0
+            elif su_an - donus_zamanlayici <= 2.0:
+                p = ARAMA_SAG if dogrula_yonu == "SAG" else ARAMA_SOL
+                motor_sur(p[0], p[1])
+            else:
+                print("[DURUM] Dönüş sonrası çizgi yok. Güvenli duruş.")
+                motor_sur(NOTR, NOTR)
+                DURUM = "CIZGI_TAKIP"
+                son_hata = 0
+                toplam_hata = 0
+            continue
+
+        # =====================================================================
+        # PROTOKOL 2: ÇİZGİ YAKALANDIĞINDA MOMENTUM SÖNÜMLEME (KİLİTLENME FRENİ)
+        # =====================================================================
+        elif DURUM == "CIZGI_YAKALANDI_FREN":
+            motor_sur(NOTR, NOTR)
+            if su_an - fren_zamanlayici > 0.18:
+                print("[KİLİTLENME BAŞARILI] Momentum sıfırlandı, çizgi takibi başlıyor.")
+                DURUM = "CIZGI_TAKIP"
+                son_hata = 0
+                toplam_hata = 0
+            continue
+
+        # =====================================================================
+        # PROTOKOL 3: ÇİZGİ KAYBOLURSA AKTİF ARAMA / KURTARMA MODU
+        # =====================================================================
+        elif DURUM == "KURTARMA_MODU":
+            mask = cizgi_maskesi(frame)                    # [FIX 1]
+            cnt, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+            if cnt and cv2.contourArea(max(cnt, key=cv2.contourArea)) > 150:
+                print("[KURTARMA TESPİTİ] Çizgi görüldü! Çizgi üstünde durmak için frenleniyor...")
+                DURUM = "CIZGI_YAKALANDI_FREN"
+                fren_zamanlayici = su_an
+                motor_sur(NOTR, NOTR)
+                continue
+
+            if su_an - kurtarma_zamanlayici <= 1.5:
+                p = ARAMA_SOL if son_kaybolma_yonu == "SOL" else ARAMA_SAG
+                motor_sur(p[0], p[1])
+            else:
+                print("[GÜVENLİ DURUŞ] 1.5 saniyede çizgi bulunamadı, motorlar durduruluyor.")
+                motor_sur(NOTR, NOTR)
+                DURUM = "CIZGI_TAKIP"
+            continue
+
+        # =====================================================================
+        # PROTOKOL 4: ANA SÜRÜŞ - ÇİFT BÖLGE (DUAL-ROI) AÇILI ÇİZGİ TAKİBİ
+        # =====================================================================
+        elif DURUM == "CIZGI_TAKIP":
+            mask = cizgi_maskesi(frame)                    # [FIX 1]
+            contours, _ = cv2.findContours(mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+
+            setpoint = 80
+            cv2.line(frame, (160, 0), (160, 240), (255, 0, 0), 2)
+
+            if len(contours) > 0:
+                c = max(contours, key=cv2.contourArea)
+                alan = cv2.contourArea(c)
+
+                if alan > 150:
+                    # [FIX 4] m00==0 durumunda cx_tam/bbox tanımsız kalıyor ve
+                    # bir önceki karenin bayat değeriyle karar veriliyordu.
+                    M_tam = cv2.moments(c)
+                    x, y, w, h = cv2.boundingRect(c)
+                    cx_tam = int(M_tam['m10'] / M_tam['m00']) if M_tam["m00"] else (x + w // 2)
+
+                    # --- 1. KESİN L-VİRAJ TESPİTİ -> ÖNCE İLERİ SÜRÜŞE GEÇ ---
+                    if alan > 600 and ((x < 15 and w > 65) or (cx_tam <= 15)):
+                        print(f"[KESKİN KÖŞE] 90° Sol L-Viraj! {VIRAJ_ILERI_SURESI} sn düz ilerleniyor...")
+                        DURUM = "VIRAJ_ILERI_SOL"
+                        viraj_zamanlayici = su_an
+                        motor_sur(DUZELTME_SEYIR_HIZI, DUZELTME_SEYIR_HIZI)
+                        continue
+                    elif alan > 600 and (((x + w) > 145 and w > 65) or (cx_tam >= 145)):
+                        print(f"[KESKİN KÖŞE] 90° Sağ L-Viraj! {VIRAJ_ILERI_SURESI} sn düz ilerleniyor...")
+                        DURUM = "VIRAJ_ILERI_SAG"
+                        viraj_zamanlayici = su_an
+                        motor_sur(DUZELTME_SEYIR_HIZI, DUZELTME_SEYIR_HIZI)
+                        continue
+
+                    # --- 2. ÇİFT BÖLGE (DUAL-ZONE) ÇAPRAZ ÇİZGİ ANALİZİ ---
+                    cx_yakin = alt_roi_cx(mask, min_alan=30)
+                    if cx_yakin is None:
+                        cx_yakin = cx_tam
+
+                    cx_uzak = cx_yakin
+                    mask_uzak = mask[30:70, :]
+                    cnt_uzak, _ = cv2.findContours(mask_uzak, cv2.RETR_EXTERNAL,
+                                                   cv2.CHAIN_APPROX_SIMPLE)
+                    if cnt_uzak:
+                        cu = max(cnt_uzak, key=cv2.contourArea)
+                        if cv2.contourArea(cu) > 30:
+                            M_u = cv2.moments(cu)
+                            if M_u["m00"]:
+                                cx_uzak = int(M_u['m10'] / M_u['m00'])
+
+                    # --- 3. KONUM VE AÇI HATASININ BİRLEŞTİRİLMESİ ---
+                    konum_hatasi = cx_yakin - setpoint
+                    aci_hatasi = cx_uzak - cx_yakin
+                    hata = konum_hatasi + (K_ACI * aci_hatasi)
+
+                    if hata < -10:
+                        son_kaybolma_yonu = "SOL"
+                    elif hata > 10:
+                        son_kaybolma_yonu = "SAG"
+
+                    if abs(hata) > HATA_ESIGI:
+                        anlik_ofset = OFS_DUZELTME
+                        dinamik_Kp = Kp * 1.35
+                    else:
+                        anlik_ofset = OFS_NORMAL
+                        dinamik_Kp = Kp
+
+                    toplam_hata += hata * dt
+                    toplam_hata = np.clip(toplam_hata, -300, 300)
+                    turev = (hata - son_hata) / dt
+                    son_hata = hata
+
+                    duzeltme = (dinamik_Kp * hata) + (Ki * toplam_hata) + (Kd * turev)
+
+                    # [FIX 0] Düzeltme ofset uzayında uygulanıp sonra DAC'a
+                    # çevriliyor -> YON=-1 seçilirse yön otomatik dönüyor.
+                    ofs_sol = np.clip(anlik_ofset + duzeltme, -OFS_MAX_TERS, OFS_MAX_ILERI)
+                    ofs_sag = np.clip(anlik_ofset - duzeltme, -OFS_MAX_TERS, OFS_MAX_ILERI)
+                    motor_sur(ileri(ofs_sol), ileri(ofs_sag))
+
+                    cv2.circle(frame, (cx_yakin * 2, 200), 6, (0, 0, 255), -1)
+                    cv2.circle(frame, (cx_uzak * 2, 100), 6, (255, 0, 0), -1)
+                    cv2.line(frame, (cx_yakin * 2, 200), (cx_uzak * 2, 100), (0, 255, 255), 2)
+                else:
+                    print(f"[UYARI] Çizgi yetersiz! {son_kaybolma_yonu} yönünde arama başlıyor...")
+                    DURUM = "KURTARMA_MODU"
+                    kurtarma_zamanlayici = su_an
+                    son_hata = 0
+                    toplam_hata = 0
+            else:
+                print(f"[UYARI] Çizgi kaybedildi! {son_kaybolma_yonu} yönünde arama başlıyor...")
+                DURUM = "KURTARMA_MODU"
+                kurtarma_zamanlayici = su_an
+                son_hata = 0
+                toplam_hata = 0
+
+            cv2.imshow("Tam Ekran Çizgi Maskesi", mask)
+
+        # =====================================================================
+        # PROTOKOL 5: VİRAJ ÖNCESİ İLERİ SÜRÜŞ (APEX YAKLAŞIMI)
+        # =====================================================================
+        elif DURUM == "VIRAJ_ILERI_SOL":
+            motor_sur(DUZELTME_SEYIR_HIZI, DUZELTME_SEYIR_HIZI)
+            if su_an - viraj_zamanlayici >= VIRAJ_ILERI_SURESI:
+                print("[APEX ULAŞILDI] Sol L-Viraj için pivot dönüşe başlanıyor...")
+                DURUM = "KESKIN_VIRAJ_SOL"
+                donus_zamanlayici = su_an
+                son_hata = 0
+                toplam_hata = 0
+            continue
+
+        elif DURUM == "VIRAJ_ILERI_SAG":
+            motor_sur(DUZELTME_SEYIR_HIZI, DUZELTME_SEYIR_HIZI)
+            if su_an - viraj_zamanlayici >= VIRAJ_ILERI_SURESI:
+                print("[APEX ULAŞILDI] Sağ L-Viraj için pivot dönüşe başlanıyor...")
+                DURUM = "KESKIN_VIRAJ_SAG"
+                donus_zamanlayici = su_an
+                son_hata = 0
+                toplam_hata = 0
+            continue
+
+        # =====================================================================
+        # PROTOKOL 6: 90 DERECE KESKİN L-VİRAJ DÖNÜŞLERİ
+        # =====================================================================
+        elif DURUM in ("KESKIN_VIRAJ_SOL", "KESKIN_VIRAJ_SAG"):
+            saga = (DURUM == "KESKIN_VIRAJ_SAG")
+            p = SAGA_PIVOT if saga else SOLA_PIVOT
+            motor_sur(p[0], p[1])
+
+            mask = cizgi_maskesi(frame)                    # [FIX 1]
+            cx = alt_roi_cx(mask, min_alan=80)             # [FIX 3] alt ROI
+            gecen = su_an - donus_zamanlayici
+
+            if cx is not None and 65 <= cx <= 95 and gecen > 0.7:
+                print("[L-VİRAJ BİTTİ] Çizgi ortalandı, kilitlenme frenine geçiliyor.")
+                DURUM = "CIZGI_YAKALANDI_FREN"
+                fren_zamanlayici = su_an
+                motor_sur(NOTR, NOTR)
+            elif gecen >= 3.5:
+                print("[L-VİRAJ TIMEOUT] Çizgi bulunamadı, aranıyor.")
+                motor_sur(NOTR, NOTR)
+                DURUM = "CIZGI_DOGRULA"
+                dogrula_yonu = "SAG" if saga else "SOL"
+                donus_zamanlayici = su_an
+            continue
+
+        cv2.imshow("Ana Kamera - PID & QR Debug (320x240)", frame)
+
+except KeyboardInterrupt:
+    print("\n[SİSTEM] Kullanıcı tarafından durduruldu (KeyboardInterrupt).")
+
+finally:
+    print("[SİSTEM] Motorlar sıfırlanıyor ve bağlantılar kapatılıyor...")
+    motor_sur(NOTR, NOTR, zorla=True)
+    time.sleep(0.1)
+    motor_sur(NOTR, NOTR, zorla=True)
+    cap.release()
+    cv2.destroyAllWindows()
+    arduino.close()
+    print("[SİSTEM] Güvenli çıkış yapıldı.")

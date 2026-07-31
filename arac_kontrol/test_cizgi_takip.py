@@ -3,7 +3,7 @@
 """cizgi_takip.py mantik testi - kamera/seri port olmadan."""
 import os, sys, numpy as np, cv2
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import cizgi_takip as CT
+import cizgi_takip_v2_referans as CT
 
 W, H = CT.ISLEM_W, CT.ISLEM_H
 gecti = basarisiz = 0

@@ -3,122 +3,112 @@
 Raspberry Pi 5 (görüntü işleme) ↔ Arduino (MCP4725 çift kanal DAC) ↔ Motor sürücüler.
 
 ```
-arduino_dac_surucu.ino   Arduino firmware (I²C DAC + watchdog + rampa)
-cizgi_takip.py           Pi 5 görüntü işleme + PID + durum makinesi
-test_cizgi_takip.py      Donanımsız mantık testi (30 kontrol)
+arduino_dac_surucu.ino      Arduino firmware                          ← YÜKLE
+cizgi_takip.py              Robotta çalışan kod (takım sürümü + FIX)  ← ÇALIŞTIR
+cizgi_takip_v2_referans.py  Temiz oda sürümü — referans/karşılaştırma
+test_cizgi_takip.py         Referans sürümün donanımsız testi (30 kontrol)
 ```
+
+`cizgi_takip.py` takımın kendi kodudur; yapısı, durum isimleri ve ayar mantığı
+aynen korunmuş, sadece `# [FIX n]` işaretli noktalar değiştirilmiştir.
 
 ---
 
-## ⚠️ İLK İŞ: Motor yönünü doğrula
+## ⚠️ İLK İŞ: `YON` bayrağını belirle
 
-Eski koddaki `TEMEL_HIZ = 1550` değeri, nötre (2048) göre `2546`'nın **tam simetriğiydi** —
-yani araç seyir halinde geri gidiyordu. Yeni kodda tüm hızlar `-1.0 … +1.0` arasında
-normalize edilir ve tek bir sabitle DAC'a çevrilir, bu yüzden hata tekrar edemez.
+Eski kodda **iki zıt yön konvansiyonu** aynı anda vardı:
 
-**Tekerlekler havadayken** (kriko/sehpa üstünde) şunu çalıştır:
+| Kanıt | Ne diyor |
+|---|---|
+| `SAGA_PIVOT = (2730, 1320)` — sağa dönmek için sol ileri, sağ geri | **yüksek = ileri** |
+| `NORMAL_SEYIR_HIZI = 1550`, `MAX_HIZ_SINIRI = 2350` "ters tork" | **düşük = ileri** |
+
+İkisi aynı anda doğru olamaz. Hangisi gerçekse diğer sabit takımı ters çalışıyordu —
+**dönüşten sonra çizginin kaybolmasının kök sebebi budur.**
+
+Artık her şey nötre göre **ofset** olarak yazılı ve tek `YON` bayrağı tüm yönleri
+birlikte çeviriyor. Tekerlekler **havadayken** belirle:
 
 ```bash
 python3 -c "
-import sys; sys.path.insert(0,'.')
-from cizgi_takip import MotorLink
-import time
-l = MotorLink()
-l.gonder(0.35, 0.35); time.sleep(2); l.kapat()
-"
+import serial, time
+a = serial.Serial('/dev/ttyUSB0', 115200); time.sleep(2)
+for _ in range(60):
+    a.write(b'<2550,2550>\n'); time.sleep(0.03)
+a.write(b'<2048,2048>\n'); a.close()"
 ```
 
 | Gözlem | Yapılacak |
 |---|---|
-| İki teker de **ileri** döndü | `YON = +1` kalsın (varsayılan) |
-| İki teker de **geri** döndü | `cizgi_takip.py` içinde `YON = -1` yap |
-| Tekerler ters yönlerde döndü | DAC adreslerini (`0x60`/`0x61`) veya sürücü kablolarını kontrol et |
+| İki teker de **ileri** döndü | `YON = +1` bırak (varsayılan) |
+| İki teker de **geri** döndü | `cizgi_takip.py` içinde `YON = -1` yap — hepsi bu |
+| Tekerler ters yönlerde döndü | DAC adresleri (`0x60`/`0x61`) veya sürücü kabloları karışık |
 
-Sonra sol/sağ ayrımı:
-
-```python
-l.gonder(0.35, 0.0)   # SOL teker dönmeli, sağ durmalı
-```
+Sonra sol/sağ ayrımı: `<2550,2048>` gönder → **sol** teker dönmeli.
 
 ---
 
 ## Kurulum (Pi 5)
 
 ```bash
-sudo apt install -y libzbar0 python3-opencv
-pip install pyserial pyzbar numpy
+sudo apt install -y libzbar0
+pip install pyserial pyzbar numpy opencv-python
 sudo usermod -aG dialout $USER      # sonra logout/login
 ```
 
-Arduino tarafı: `Adafruit MCP4725` kütüphanesi (Library Manager) → `arduino_dac_surucu.ino` yükle.
-
-## Çalıştırma
+Arduino IDE: `Adafruit MCP4725` kütüphanesini kur → `arduino_dac_surucu.ino` yükle.
+**Bu firmware'i yüklemek şart** — eskisindeki `Serial.parseInt()` 1000 ms timeout ile
+loop'u kilitliyor ve o süre boyunca watchdog çalışamıyor (pivot sırasında aşırı dönüş).
 
 ```bash
-python3 cizgi_takip.py              # pencereli (masaüstü / VNC)
-python3 cizgi_takip.py --headless   # SSH veya systemd servisi
-python3 cizgi_takip.py --kalibre    # motora komut gitmez, sadece görüntü + eşik ayarı
-python3 test_cizgi_takip.py         # donanım olmadan mantık testi
+python3 cizgi_takip.py              # çalıştır ('q' ile çık)
+python3 test_cizgi_takip.py         # referans sürümün mantık testi
 ```
-
-Çıkış: pencere odaktayken **`q`**, ya da terminalde **Ctrl+C**. Her iki durumda da
-`finally` + `atexit` motorları nötre indirir; ayrıca Arduino 250 ms komut kesintisinde
-kendi başına durur.
 
 ---
 
-## Görüntü işleme mimarisi
+## Yapılan düzeltmeler
 
-Kare 320×240 alınır, analiz 160×120'de yapılır. Üç yatay bant taranır:
-
-| Bant | Kare oranı | Görevi |
+| FIX | Sorun | Etki |
 |---|---|---|
-| **YAKIN** | %72–98 | Direksiyon hatası (PID girişi) |
-| **ORTA** | %46–70 | Eğrilik tahmini |
-| **UZAK** | %20–44 | Ön-görüş (feed-forward) + hız kesme |
+| **0** | İki zıt yön konvansiyonu | Dönüşten sonra çizgi kayboluyordu. Artık tek `YON` bayrağı. Pivotlar da simetrik hâle getirildi (eskisi −728/+672 idi, dönerken yana kaydırıyordu) |
+| **1** | Sabit eşik `inRange(0, 85)` | Araç dönüp kamera farklı aydınlatmaya bakınca çizgi kayboluyordu → **Otsu** + aralık kilidi + kareler arası yumuşatma |
+| **1b** | Eşik 85'ten yumuşayarak geliyordu | Karanlık sahnede ilk karelerde **tüm görüntü "çizgi"** oluyordu (`x=0, w=160`) → sahte L-viraj. Artık ilk karede doğrudan Otsu'ya oturuyor |
+| **1c** | Maske makullük kontrolü yoktu | Koyu piksel oranı %1–55 dışındaysa maskeye güvenilmiyor (gölge / kapanan kamera / patlayan pozlama) |
+| **2** | `DOKSAN_DERECE_SAG` açık çevrim 0.7 sn | Akü düştükçe eksik/fazla dönüyordu → **kapalı çevrim**: çizgi ortalanınca biter, süre sadece üst sınır |
+| **3** | `CIZGI_DOGRULA` yerinde durup bakıyordu | Duran araç çizgiyi kadraja hiç sokamaz → **yavaşça dönerek arar**. Ayrıca tam çözünürlük yerine aynı 160×120 hattı ve **alt ROI** (tüm kare, QR'ın kendi siyahını "çizgi" sayıyordu) |
+| **4** | `cx_tam` / bbox init yok | `M["m00"]==0` olunca bir önceki karenin bayat değeriyle karar veriliyordu |
+| **5** | `waitKey` en alttaydı | Bütün manevra durumları `continue` ile çıktığı için **pivot boyunca `q` ölüydü** → döngü başına alındı |
+| **6** | `time.time()` | Pi 5'te RTC yok; NTP senkronu saati geri sıçratıp `dt`'yi negatife düşürebiliyor → türev patlar. `time.monotonic()` |
+| **7** | Seri akış kontrolü yoktu | Kamera hızında spam Arduino RX buffer'ını doldurup bayat komut uygulatıyordu → 50 Hz sınırı + heartbeat okuma |
 
-Her bant için:
-1. Gauss bulanıklaştırma → **Otsu** ile uyarlanabilir eşik
-2. Eşik `[35, 135]` aralığına kilitlenir ve kareler arası yumuşatılır (ani ışık değişiminde kaçmaz)
-3. Koyu piksel oranı `%1–%55` dışındaysa ölçüm **geçersiz** sayılır (gölge / kapalı kamera koruması)
-4. Morfolojik açma → en büyük kontur → centroid `-1.0 … +1.0` normalize
+**Arduino tarafı:** `parseInt()` → bloklamayan ayrıştırıcı, RX buffer'daki tüm paketler
+okunup sadece en yenisi uygulanıyor, I²C 400 kHz, watchdog 400→250 ms, slew-rate limiter.
 
-**Direksiyon** = PID(yakın.cx) + `FF_KAZANC × (uzak.cx − yakın.cx)`
-**Hız** = `HIZ_SEYIR × (1 − YAVASLAMA × eğrilik)`, taban `HIZ_MIN`
-
-Yani viraja girmeden önce tekerlek dönmeye başlar ve araç kendiliğinden yavaşlar.
+---
 
 ## Durum makinesi
 
 ```
-CIZGI_TAKIP ──köşe──► PIVOT_SOL / PIVOT_SAG ──çizgi ortalandı──► CIZGI_TAKIP
-     │                        └──süre doldu──► CIZGI_ARA ──► CIZGI_TAKIP
-     └──QR "11" doğrulandı──► QR_YAKLASIM ──► QR_FREN ──► PIVOT_QR ──► CIZGI_TAKIP
-     └──çizgi 0.8 sn yok──► CIZGI_ARA
+CIZGI_TAKIP ──L-viraj──► VIRAJ_ILERI_x ──► KESKIN_VIRAJ_x ──┐
+     │                                    (timeout) └──► CIZGI_DOGRULA ──┐
+     ├──QR "11"──► QR_YAKLASIM ──► QR_GORULDU_FREN ──► DOKSAN_DERECE_SAG ─┤
+     │                                          (timeout) └──► CIZGI_DOGRULA
+     ├──çizgi zayıf/yok──► KURTARMA_MODU ─────────────────────────────────┤
+     │                                                                    ▼
+     └────────────────────────────────────────── CIZGI_YAKALANDI_FREN ────┘
 ```
 
-Pivotlar **kapalı çevrim**: çizgi merkeze oturunca biter (`KOSE_CIKIS`), süre sadece üst
-sınırdır. Eski koddaki sabit 1.4 sn açık çevrim, akü voltajı düştükçe açıyı tutturamıyordu.
-
----
+Bütün pivotlar kapalı çevrim: alt ROI'deki çizgi merkeze (`65 ≤ cx ≤ 95`) oturunca biter.
+Süreler yalnızca üst sınırdır. Zaman aşımında araç durmaz — `CIZGI_DOGRULA` ile
+yavaşça dönerek arar, 2 sn bulamazsa güvenli duruşa geçer.
 
 ## Ayar sırası (piste çıkınca)
 
-1. `--kalibre` ile bantların çizgiyi doğru gördüğünü ve `esik` değerinin oturduğunu doğrula
-2. `HIZ_SEYIR`'i düşük başlat (0.35), PID'i oturt, sonra yükselt
+1. `YON` bayrağını yukarıdaki testle kesinleştir — **her şeyden önce bu**
+2. `OFS_NORMAL`'i düşük başlat (300), PID'i oturt, sonra yükselt
 3. `Kp` → salınım başlayana kadar artır, sonra %60'ına çek
 4. `Kd` → salınımı sönümleyene kadar artır (fazlası tekerde titreme yapar)
-5. `Ki` → en son, kalıcı yanal kaymayı silmek için
-6. `KOSE_CX_ESIK` / `KOSE_EN_BOY` → L-virajda tetiklenip düz yolda tetiklenmemeli
-
-## Değiştirilen davranışlar (eski koda göre)
-
-- Eski "akıllı refleks" (maskede kareye benzeyen kontur → 90° dönüş) **kaldırıldı**.
-  QR içeriği `pyzbar` ile doğrulanmadan hiçbir manevra tetiklenmez. Eski hâlinde
-  gölge, bant yaması veya T-kavşak aracı yanlış yöne döndürebiliyordu.
-- `time.time()` → `time.monotonic()` (Pi 5'te RTC yok; NTP senkronu `dt`'yi negatife
-  düşürüp PID'i patlatabiliyordu)
-- `CAP_PROP_BUFFERSIZE = 1` (V4L2 varsayılanı 4 kare biriktirip ~100 ms ölü zaman yaratıyordu)
-- `cv2.waitKey` artık her karede çağrılıyor — pivot sırasında da `q` çalışır
-- Arduino: `parseInt()` yerine bloklamayan ayrıştırıcı (1 sn timeout watchdog'u durduruyordu),
-  I²C 400 kHz, watchdog 400→250 ms, rampa sınırlayıcı
+5. `K_ACI` → çapraz çizgide öngörüyü ayarla
+6. `VIRAJ_ILERI_SURESI` → kamera burunda olduğu için köşeye varış gecikmesi (0.4–1.0 sn)
+7. `OFS_PIVOT` → pivot çizgiyi atlamayacak kadar yavaş, momentum yenecek kadar hızlı
