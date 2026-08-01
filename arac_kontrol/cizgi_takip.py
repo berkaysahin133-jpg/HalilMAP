@@ -59,6 +59,8 @@ _son_paket = None
 def motor_sur(sol_dac, sag_dac, zorla=False):
     """Arduino'ya <Sol,Sag> DAC paketi. 50 Hz sinirli (firmware watchdog 250 ms)."""
     global _son_gonderim, _son_paket
+    if MOTOR_TAKAS:
+        sol_dac, sag_dac = sag_dac, sol_dac
     paket = (int(np.clip(sol_dac, 0, 4095)), int(np.clip(sag_dac, 0, 4095)))
     simdi = time.monotonic()
     if not zorla and paket == _son_paket and (simdi - _son_gonderim) < 0.02:
@@ -88,6 +90,15 @@ NOTR = 2048
 # Bench testi: motor_sur(ileri(500), ileri(500)) ile araç İLERİ gitmeli.
 #   +1 -> DAC > 2048 ileri     |     -1 -> DAC < 2048 ileri
 YON = -1        # <<< araç ters gittiği için çevrildi
+
+# --- SOL/SAĞ ve KAMERA YÖNÜ ---
+# "Düz giderken bir tarafa kayıp çizgiyi kaybediyor" belirtisi POZİTİF GERİ
+# BESLEME demektir: araç çizgiden UZAĞA direksiyon kırıyor. Kontrol matematiği
+# doğruysa geriye iki fiziksel sebep kalır ve ikisi de tek bayrakla düzelir.
+# Hangisi olduğunu `python3 teshis.py` söyler.
+MOTOR_TAKAS = False   # True: 0x60 fiziksel SAĞ tekere bağlıysa (sol/sağ takas)
+KAMERA_AYNA = False   # True: kamera ayna görüntü veriyorsa (yatay çevir)
+KAMERA_TERS = False   # True: kamera 180 derece ters monteyse
 # ----------------------------------------------------------------------------
 
 # Nötre göre ofsetler (YON bunları otomatik doğru tarafa koyar)
@@ -165,6 +176,7 @@ CIZGI_KAYIP_SURE = 0.9
 ARAMA_SURE       = 2.0
 
 GOSTER = True                   # SSH'tan çalıştırıyorsan False yap
+TELEMETRI = True                # her kareyi telemetri.csv'ye yaz (sorun analizi)
 
 
 def ileri(ofset):
@@ -474,7 +486,14 @@ except Exception:
 
 def taze_kare():
     cap.grab()
-    return cap.retrieve()
+    ok, kare = cap.retrieve()
+    if not ok or kare is None:
+        return False, None
+    if KAMERA_TERS:
+        kare = cv2.rotate(kare, cv2.ROTATE_180)
+    elif KAMERA_AYNA:
+        kare = cv2.flip(kare, 1)
+    return True, kare
 
 
 # =============================================================================
@@ -493,7 +512,16 @@ kose_taban_t = None
 arama_yonu = +1
 fps = 0.0
 
+import csv as _csv
+_tel_dosya = _tel = None
+if TELEMETRI:
+    _tel_dosya = open("telemetri.csv", "w", newline="", encoding="utf-8")
+    _tel = _csv.writer(_tel_dosya)
+    _tel.writerow(["t", "durum", "gecerli", "guven", "hata", "egim", "egrilik",
+                   "pencere", "bitis_y", "kose", "sol_dac", "sag_dac"])
+
 print(f"[SİSTEM] YON={YON:+d} | seyir={SEYIR} | pivot sağ={PIVOT_SAG} sol={PIVOT_SOL}")
+print(f"[SİSTEM] MOTOR_TAKAS={MOTOR_TAKAS}  KAMERA_AYNA={KAMERA_AYNA}  KAMERA_TERS={KAMERA_TERS}")
 print("[SİSTEM] Kayan pencere algılama + eğriliğe göre hız. Çıkış: 'q'")
 
 
@@ -651,6 +679,13 @@ try:
                 pid.sifirla()
                 gec("CIZGI_TAKIP", "çizgi geri geldi")
 
+        if _tel is not None:
+            sp = _son_paket if _son_paket else (NOTR, NOTR)
+            _tel.writerow([f"{simdi:.3f}", DURUM, int(o.gecerli), f"{o.guven:.2f}",
+                           f"{o.hata:+.3f}", f"{o.egim:+.3f}", f"{o.egrilik:+.3f}",
+                           len(o.noktalar), f"{o.bitis_y:.0f}", o.kose_yonu,
+                           sp[0], sp[1]])
+
         # ------------------------------------------------------ görselleştirme
         if GOSTER:
             g = frame.copy()
@@ -683,6 +718,9 @@ finally:
     time.sleep(0.1)
     motor_sur(NOTR, NOTR, zorla=True)
     cap.release()
+    if _tel_dosya is not None:
+        _tel_dosya.close()
+        print("[SİSTEM] telemetri.csv yazıldı.")
     if GOSTER:
         cv2.destroyAllWindows()
     try:
