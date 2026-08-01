@@ -1,0 +1,220 @@
+# -*- coding: utf-8 -*-
+"""Slamtec RPLIDAR C1 - bagimsiz surucu (sadece pyserial gerekir).
+
+Neden kendi surucumuz:
+  ROS 2 kurulumu bir saat alabilir. Bu dosya, LiDAR'in calistigini ve veri
+  aktigini 5 dakikada dogrulamani saglar. ROS'a sonra gecersin.
+
+C1 ozellikleri (uretici verisi):
+  menzil 0.05-12 m (beyaz yuzey) / 0.05-6 m (siyah)
+  tarama 8-12 Hz (tipik 10)      ornekleme 5 kHz
+  acisal cozunurluk 0.72 derece  arayuz TTL UART, 460800 baud
+  mesafe cozunurlugu 30 mm       dogruluk 15 mm
+
+DIKKAT -- en sik yapilan hata: C1'in baud hizi 460800'dur.
+A1/A2 icin yazilmis ornekler 115200 kullanir; o hizla C1'den hicbir sey
+okuyamazsin (port acilir ama veri gelmez).
+
+Protokol (Slamtec standart SCAN, 5 bayt/olcum):
+    bayt0: bit0 = yeni tur bayragi (S)
+           bit1 = S'nin DEGILI (dogrulama)
+           bit2-7 = kalite
+    bayt1: bit0 = kontrol biti (1 olmali)
+           bit1-7 = aci_q6'nin dusuk 7 biti
+    bayt2: aci_q6'nin yuksek 8 biti
+    bayt3-4: mesafe_q2 (little endian)
+    aci_derece = ((bayt1>>1) | (bayt2<<7)) / 64
+    mesafe_mm  = (bayt3 | (bayt4<<8)) / 4
+"""
+
+import time
+
+try:
+    import serial
+except ImportError:
+    serial = None
+
+# ---------------------------------------------------------------- komutlar
+BAYRAK = b"\xA5"
+KOMUT_STOP = b"\x25"
+KOMUT_RESET = b"\x40"
+KOMUT_SCAN = b"\x20"
+KOMUT_BILGI = b"\x50"
+KOMUT_SAGLIK = b"\x52"
+
+YANIT_BASI = b"\xA5\x5A"
+
+SAGLIK_METIN = {0: "iyi", 1: "uyari", 2: "hata"}
+
+
+class LidarHatasi(Exception):
+    pass
+
+
+def olcum_coz(bes_bayt):
+    """5 baytlik olcumu (yeni_tur, kalite, aci_derece, mesafe_mm) yapar.
+
+    Gecersizse LidarHatasi firlatir -- cagiran taraf 1 bayt kaydirip
+    yeniden hizalanir.
+    """
+    b0, b1, b2, b3, b4 = bes_bayt
+    yeni = bool(b0 & 0b1)
+    yeni_degil = bool((b0 >> 1) & 0b1)
+    if yeni == yeni_degil:
+        raise LidarHatasi("yeni tur bayragi tutarsiz")
+    if (b1 & 0b1) != 1:
+        raise LidarHatasi("kontrol biti 1 degil")
+    kalite = b0 >> 2
+    aci = ((b1 >> 1) | (b2 << 7)) / 64.0
+    mesafe = (b3 | (b4 << 8)) / 4.0
+    return yeni, kalite, aci, mesafe
+
+
+class RPLidarC1:
+    def __init__(self, port="/dev/ttyUSB0", baud=460800, zaman_asimi=1.0):
+        if serial is None:
+            raise RuntimeError("pyserial kurulu degil:  pip install pyserial")
+        self.port_adi = port
+        self.baud = baud
+        self.ser = serial.Serial(port, baud, timeout=zaman_asimi,
+                                 parity=serial.PARITY_NONE,
+                                 stopbits=serial.STOPBITS_ONE)
+        # A1'de DTR motoru durdurur. C1'de etkisiz ama zararsiz -- garanti olsun.
+        self.ser.dtr = False
+        self._tarama_acik = False
+        time.sleep(0.1)
+        self.ser.reset_input_buffer()
+
+    # -------------------------------------------------------------- dusuk seviye
+    def _komut(self, kod):
+        self.ser.write(BAYRAK + kod)
+
+    def _tanimlayici_oku(self):
+        """7 baytlik yanit tanimlayicisi. (uzunluk, mod, tip) doner."""
+        d = self.ser.read(7)
+        if len(d) != 7:
+            raise LidarHatasi(
+                f"tanimlayici okunamadi ({len(d)} bayt geldi). "
+                f"Baud hizi dogru mu? C1 icin 460800 olmali.")
+        if d[0:2] != YANIT_BASI:
+            raise LidarHatasi(f"gecersiz yanit basligi: {d[0:2].hex()}")
+        uzunluk = d[2] | (d[3] << 8) | (d[4] << 16) | ((d[5] & 0x3F) << 24)
+        mod = d[5] >> 6
+        return uzunluk, mod, d[6]
+
+    # ------------------------------------------------------------------ bilgi
+    def bilgi(self):
+        self.ser.reset_input_buffer()
+        self._komut(KOMUT_BILGI)
+        uzunluk, _, tip = self._tanimlayici_oku()
+        d = self.ser.read(uzunluk)
+        if len(d) != uzunluk:
+            raise LidarHatasi("bilgi paketi eksik")
+        return {
+            "model": d[0],
+            "yazilim": f"{d[2]}.{d[1]}",
+            "donanim": d[3],
+            "seri_no": d[4:20][::-1].hex().upper(),
+        }
+
+    def saglik(self):
+        self.ser.reset_input_buffer()
+        self._komut(KOMUT_SAGLIK)
+        uzunluk, _, _ = self._tanimlayici_oku()
+        d = self.ser.read(uzunluk)
+        if len(d) != uzunluk:
+            raise LidarHatasi("saglik paketi eksik")
+        durum = d[0]
+        hata_kodu = d[1] | (d[2] << 8)
+        return {"durum": durum, "metin": SAGLIK_METIN.get(durum, "?"),
+                "hata_kodu": hata_kodu}
+
+    # ------------------------------------------------------------------ tarama
+    def tarama_baslat(self):
+        self.ser.reset_input_buffer()
+        self._komut(KOMUT_SCAN)
+        uzunluk, mod, tip = self._tanimlayici_oku()
+        if uzunluk != 5:
+            raise LidarHatasi(f"beklenmeyen olcum boyu: {uzunluk}")
+        self._tarama_acik = True
+
+    def olcumler(self, max_kotu=1000):
+        """Sonsuz olcum ureteci: (yeni_tur, kalite, aci, mesafe).
+
+        Bozuk bayt gelirse 1 bayt kaydirip yeniden hizalanir -- gercek
+        kullanimda seri hattinda tek bayt kaymasi olur ve sabit boyutlu
+        okuma yapan kod bir daha ASLA duzelemez.
+        """
+        if not self._tarama_acik:
+            self.tarama_baslat()
+        tampon = bytearray()
+        kotu = 0
+        while True:
+            gerek = 5 - len(tampon)
+            if gerek > 0:
+                yeni = self.ser.read(max(gerek, self.ser.in_waiting or gerek))
+                if not yeni:
+                    raise LidarHatasi("veri gelmiyor (zaman asimi)")
+                tampon.extend(yeni)
+            while len(tampon) >= 5:
+                try:
+                    sonuc = olcum_coz(tampon[:5])
+                except LidarHatasi:
+                    del tampon[0]            # 1 bayt kaydir, yeniden dene
+                    kotu += 1
+                    if kotu > max_kotu:
+                        raise LidarHatasi("surekli bozuk veri -- baud hizi yanlis olabilir")
+                    continue
+                del tampon[:5]
+                kotu = 0
+                yield sonuc
+
+    def taramalar(self, min_nokta=90):
+        """Tam turlari uretir: [(aci, mesafe, kalite), ...]
+
+        min_nokta: bundan az noktali turlar atlanir (baslangicta yarim tur gelir).
+        """
+        tur = []
+        for yeni, kalite, aci, mesafe in self.olcumler():
+            if yeni and tur:
+                if len(tur) >= min_nokta:
+                    yield tur
+                tur = []
+            if mesafe > 0:                   # 0 = olcum yok (cok yakin/uzak/siyah)
+                tur.append((aci, mesafe, kalite))
+
+    # ------------------------------------------------------------------ kapat
+    def durdur(self):
+        self._komut(KOMUT_STOP)
+        self._tarama_acik = False
+        time.sleep(0.01)
+        self.ser.reset_input_buffer()
+
+    def sifirla(self):
+        self._komut(KOMUT_RESET)
+        time.sleep(0.5)
+        self.ser.reset_input_buffer()
+
+    def kapat(self):
+        try:
+            self.durdur()
+        except Exception:
+            pass
+        if self.ser and self.ser.is_open:
+            self.ser.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        self.kapat()
+
+
+def port_bul():
+    """Bagli ilk USB seri portu bulur."""
+    import glob
+    for kalip in ("/dev/ttyUSB*", "/dev/ttyACM*", "COM*"):
+        b = sorted(glob.glob(kalip))
+        if b:
+            return b[0]
+    return None
