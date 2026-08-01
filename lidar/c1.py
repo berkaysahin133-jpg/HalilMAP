@@ -211,10 +211,41 @@ class RPLidarC1:
 
 
 def port_bul():
-    """Bagli ilk USB seri portu bulur."""
+    """Bagli ilk USB seri portu bulur (Linux + Windows).
+
+    glob("COM*") Windows'ta CALISMAZ -- COM portlari dosya sistemi girdisi
+    degildir. pyserial'in port listeleyicisi kullanilir.
+    """
+    try:
+        from serial.tools import list_ports
+        adaylar = list(list_ports.comports())
+        # USB-seri kopruleri once (CP210x / CH340 / FTDI / Silicon Labs)
+        anahtar = ("cp210", "ch340", "ch910", "ftdi", "silicon", "usb")
+        adaylar.sort(key=lambda p: 0 if any(
+            a in (str(p.description) + str(p.manufacturer)).lower()
+            for a in anahtar) else 1)
+        for p in adaylar:
+            return p.device
+    except Exception:
+        pass
     import glob
-    for kalip in ("/dev/ttyUSB*", "/dev/ttyACM*", "COM*"):
+    for kalip in ("/dev/ttyUSB*", "/dev/ttyACM*"):
         b = sorted(glob.glob(kalip))
         if b:
             return b[0]
     return None
+
+
+def portlari_listele():
+    """Bagli tum seri portlari yazdirir -- hangisi oldugunu bulmak icin."""
+    try:
+        from serial.tools import list_ports
+        p = list(list_ports.comports())
+        if not p:
+            print("  (hic seri port yok)")
+        for x in p:
+            print(f"  {x.device:20s} {x.description}")
+        return [x.device for x in p]
+    except Exception as e:
+        print(f"  liste alinamadi: {e}")
+        return []
