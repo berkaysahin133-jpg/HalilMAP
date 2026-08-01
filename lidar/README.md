@@ -1,9 +1,11 @@
 # RPLIDAR C1 — başlangıç
 
 ```
-c1.py        Bağımsız sürücü (sadece pyserial). ROS gerekmez.
-goster.py    Canlı görünüm / kayıt / oynatma / sentetik oda
-test_c1.py   Protokol testi — LİDAR TAKILI OLMADAN çalışır (16 kontrol)
+c1.py           Bağımsız sürücü (sadece pyserial). ROS gerekmez.
+goster.py       Canlı görünüm / kayıt / oynatma / sentetik oda
+harita.py       2D harita: tek tarama + gezerek (ICP-SLAM)
+test_c1.py      Protokol testi — LİDAR OLMADAN çalışır (16 kontrol)
+test_harita.py  ICP/SLAM testi — LİDAR OLMADAN çalışır (20 kontrol)
 ```
 
 ## Cihaz (Slamtec RPLIDAR C1)
@@ -39,6 +41,46 @@ tarama. Odanın duvarları çıkmalı. LiDAR'ı elinle döndür, nokta bulutu d�
 python3 goster.py --kayit depo1     # gez, çık -> depo1.npz
 python3 goster.py --oynat depo1.npz # robot olmadan tekrar tekrar incele
 ```
+
+## Odanın 2D haritası
+
+```bash
+python3 test_harita.py                 # önce donanımsız doğrula -> 20/20
+
+python3 harita.py --sahte --slam       # LiDAR gelmeden sentetik odada dene
+python3 harita.py --tek                # odanın ORTASINA koy, sabit dur
+python3 harita.py --slam               # LiDAR'ı elinde yavaşça gezdir
+python3 harita.py --oynat oda1.npz     # kayıttan harita çıkar
+```
+
+Çıktı: `harita.png` + `harita.npz` (ızgara + çözünürlük + poz geçmişi).
+
+**`--tek`** odanın ortasından tek 360° tarama alır. Bu zaten bir haritadır —
+SLAM'e gerek yok. Eşyaların ARKASI görünmez (gölge kalır), o kadar.
+
+**`--slam`** her yeni taramayı biriken haritaya **ICP** ile oturtur; böylece
+sensörün ne kadar hareket ettiğini görüntüden çıkarır. Tekerlek enkoderi
+olmadan "odometri" tam olarak böyle üretilir — ve kayma da buradan gelir.
+
+### Ölçülen doğruluk (sentetik oda, gerçek yörünge biliniyor)
+
+| Senaryo | Sapma |
+|---|---|
+| 2.34 m düz | **0.8 cm** (ortalama 0.4 cm) |
+| 90° dönüşlü güzergâh | 1.0 cm / **0.18°** |
+| 3 cm ölçüm gürültüsü | 1.8 cm |
+| **6.8 m kapalı güzergâh, 2 dönüş** | **24.4 cm** ← kayma burada başlıyor |
+| Gezdikten sonra oda ölçüsü (6.0 × 4.0 m) | ±9 cm |
+
+Son satır önemli: yol uzadıkça ve dönüş sayısı arttıkça hata **birikir**.
+Küçük odada sorun değil, depoda olur. Çözümü döngü kapama (loop closure) ve
+odometri — ikisi de `slam_toolbox`'ta var, bu basit sürümde yok.
+
+### Haritan aynaysa
+
+`harita.py` içinde `ACI_YONU = +1` var. Gerçek cihazda tarama açısı ters
+yönde artıyorsa harita sağ/sol takas çıkar (boyutlar doğru, yerleşim ayna).
+O zaman `ACI_YONU = -1` yap.
 
 ## PC mi, Jetson mu?
 
