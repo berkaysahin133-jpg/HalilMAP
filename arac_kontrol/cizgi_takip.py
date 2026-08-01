@@ -139,15 +139,32 @@ PENCERE_SAYISI   = 8            # kayan pencere adedi
 PENCERE_YARI     = 26           # kayan pencere yarı genişliği (px)
 PENCERE_MIN_PX   = 18           # bu sayının altında pencere "boş"
 MAX_BOS_PENCERE  = 2
-MIN_PENCERE      = 3            # fit için gereken en az dolu pencere
+MIN_PENCERE      = 2            # fit için gereken en az dolu pencere.
+                                # 3 idi; keskin köşeye yaklaşırken önümüzdeki
+                                # dikey çizgi kısalıyor, 3 pencere dolmuyor ve
+                                # algılama "çizgi yok" diyordu -> araç tam
+                                # köşede duruyordu. Asıl aradığımız belirti buydu.
 KOYU_ORAN_MIN    = 0.005
 KOYU_ORAN_MAX    = 0.55
 
 # --- Köşe (L-viraj) ---
 ACI_REF_DERECE   = 30.0         # bu açı egim = 1.0 demek (normalizasyon)
-KOSE_KOSU_PX     = 52           # köşeyi kanıtlayan yatay uzantı (px, 160 genişlikte)
-KOSE_MAX_ARTIK   = 3.5          # çizgi bu kadar düz değilse köşe SAYILMAZ (yay koruması)
+KOSE_KOSU_PX     = 34           # köşeyi kanıtlayan yatay uzantı (px, 160 genişlikte).
+                                # 52 gerçek araçta çok katıydı: köşe kadrajın
+                                # üstünde perspektifle ezilmiş göründüğü için
+                                # o uzunluğa hiç ulaşmıyor ve köşe kaçırılıyordu.
+KOSE_BAND_YARI   = 9            # yatay koşunun arandığı bandın yarı yüksekliği
+KOSE_MIN_KUTLE   = 260          # yan-kütle ölçümü için gereken en az piksel
+KOSE_KUTLE_ORANI = 0.75         # sol/sağ kütle dengesizliği bu oranı aşarsa köşe.
+                                # 0.55 dar yayda (R=55) sahte köşe tetikliyordu.
+KOSE_MAX_ARTIK   = 2.5          # çizgi bu kadar düz değilse köşe SAYILMAZ.
+                                # 3.5 idi; dar yay (R=55) 2.90 üretip geçiyordu.
+                                # Gerçek köşe 0.0-2.3 aralığında.
+KOSE_MIN_KISALMA = 2            # köşe için zincir en az bu kadar KISALMIŞ olmalı
+                                # (gerçek köşede dikey çizgi biter, yayda bitmez)
 KOSE_ONAY_KARE   = 3            # bu kadar üst üste görülmeden manevra yok
+KOSE_IPUCU_OMRU  = 1.2          # çizgi kaybolduğunda bu kadar geçmişteki köşe
+                                # ipucu hâlâ geçerli sayılır (durma, ilerle)
 # Köşeye yaklaşma: SABİT SÜRE DEĞİL, kapalı çevrim.
 # Dikey çizginin bittiği satır (bitis_y) kadraj tabanına inince köşe artık
 # kameranın kör bölgesindedir; oradan sonra yalnızca kör bölge kadar
@@ -235,7 +252,7 @@ def cizgi_maskesi(frame_bgr):
 
 class Olcum:
     __slots__ = ("gecerli", "guven", "hata", "egim", "kose_yonu", "kosu_px",
-                 "noktalar", "bitis_y", "maske", "duzluk", "egrilik")
+                 "noktalar", "bitis_y", "maske", "duzluk", "egrilik", "kose_ipucu")
 
     def __init__(self):
         self.gecerli = False
@@ -248,6 +265,7 @@ class Olcum:
         self.bitis_y = ISL_H
         self.duzluk = 99.0     # dogruya gore artik (px) -- kucukse cizgi DUZ
         self.egrilik = 0.0     # -1..+1  (+ = cizgi saga kivriliyor)
+        self.kose_ipucu = 0    # onaylanmamis ham kose yonu (tek karelik)
         self.maske = None
 
 
@@ -304,34 +322,71 @@ class Dedektor:
         return merkezler
 
     def _kose_analiz(self, maske, merkezler):
-        """Çizgi takibi bittiği yerde yatay uzantı var mı? (köşenin 2. kanıtı)"""
+        """Köşe yönü + kanıt gücü. İki bağımsız ölçüm, en güçlüsü kazanır.
+
+        Gerçek 90 derece köşede dikey çizgi biter ve yerine YANA uzanan bir bant
+        gelir. Eskiden yalnızca takibin bittiği satırda ±5 px'lik dar bir bantta
+        yatay koşu ölçüyordum; gerçek araçta köşe kadrajın üstünde, perspektifle
+        ezilmiş halde göründüğü için bu bant onu çoğu zaman ıskalıyordu.
+        """
         if not merkezler:
             return 0, 0.0
         sx, sy, _ = merkezler[-1]
-        y0 = int(max(0, sy - 5))
-        y1 = int(min(ISL_H, sy + 5))
-        band = maske[y0:y1, :]
-        if band.size == 0:
-            return 0, 0.0
-        sut = (band.max(axis=0) > 0).astype(np.uint8)
-        x0 = int(np.clip(sx, 0, ISL_W - 1))
-        if sut[x0] == 0:
-            dolu = np.flatnonzero(sut)
-            if dolu.size == 0:
-                return 0, 0.0
-            x0 = int(dolu[np.argmin(np.abs(dolu - x0))])
-        sol = x0
-        while sol > 0 and sut[sol - 1]:
-            sol -= 1
-        sag = x0
-        while sag < ISL_W - 1 and sut[sag + 1]:
-            sag += 1
-        sol_u, sag_u = x0 - sol, sag - x0
-        if sag_u >= KOSE_KOSU_PX and sag_u > sol_u * 1.5:
-            return +1, float(sag_u)
-        if sol_u >= KOSE_KOSU_PX and sol_u > sag_u * 1.5:
-            return -1, float(sol_u)
-        return 0, float(max(sol_u, sag_u))
+
+        # --- ÖLÇÜM 1: çizginin bittiği yerde yatay koşu (geniş bant) ---
+        band_yari = max(6, KOSE_BAND_YARI)
+        y0 = int(max(0, sy - band_yari))
+        y1 = int(min(ISL_H, sy + band_yari))
+        kosu_yon, kosu_guc = 0, 0.0
+        if y1 > y0:
+            sut = (maske[y0:y1, :].max(axis=0) > 0).astype(np.uint8)
+            x0 = int(np.clip(sx, 0, ISL_W - 1))
+            if sut[x0] == 0:
+                dolu = np.flatnonzero(sut)
+                if dolu.size:
+                    x0 = int(dolu[np.argmin(np.abs(dolu - x0))])
+            if sut[x0]:
+                sol = x0
+                while sol > 0 and sut[sol - 1]:
+                    sol -= 1
+                sag = x0
+                while sag < ISL_W - 1 and sut[sag + 1]:
+                    sag += 1
+                sol_u, sag_u = float(x0 - sol), float(sag - x0)
+                if sag_u >= KOSE_KOSU_PX and sag_u > sol_u * 1.4:
+                    kosu_yon, kosu_guc = +1, sag_u
+                elif sol_u >= KOSE_KOSU_PX and sol_u > sag_u * 1.4:
+                    kosu_yon, kosu_guc = -1, sol_u
+
+        # --- ÖLÇÜM 2: çizgi bitişinin ÜSTÜNDE kütle hangi tarafta? ---
+        # Takip zinciri kısaldığında bile çalışır: köşenin yatay kolu, dikey
+        # çizginin bittiği yerin üstünde bir tarafta ciddi piksel yığını yapar.
+        ust = maske[0:max(1, int(sy)), :]
+        kutle_yon, kutle_guc = 0, 0.0
+        if ust.size:
+            merkez = ISL_W // 2
+            sol_k = float(np.count_nonzero(ust[:, :merkez]))
+            sag_k = float(np.count_nonzero(ust[:, merkez:]))
+            toplam = sol_k + sag_k
+            if toplam > KOSE_MIN_KUTLE:
+                dengesizlik = (sag_k - sol_k) / toplam
+                if abs(dengesizlik) > KOSE_KUTLE_ORANI:
+                    kutle_yon = +1 if dengesizlik > 0 else -1
+                    kutle_guc = abs(dengesizlik) * ISL_W * 0.5
+
+        # Yan-kütle ölçümü YALNIZCA DOĞRULAYICIDIR, tek başına tetiklemez.
+        # Ölçüm verisi (düz / dar yay R=55 / gerçek 90 köşe):
+        #     düz yol      : duzluk 0.0        kosu_px 0
+        #     dar yay R=55 : duzluk 1.8-8.4    kosu_px 0-63
+        #     gerçek köşe  : duzluk 0.0-2.3    kosu_px 71-77
+        # Yani "yatay koşu + düzlük" ikilisi ikisini zaten temiz ayırıyor.
+        # Kütle dengesizliğinin böyle bir ayrımı yok; bağımsız tetik yapılınca
+        # dar yayda sahte köşe üretiyordu (kapalı çevrimde 116 mm sapma).
+        if kosu_yon == 0:
+            return 0, kosu_guc
+        if kutle_yon and kutle_yon != kosu_yon:
+            return 0, kosu_guc                  # çelişki -> güvenme
+        return kosu_yon, max(kosu_guc, kutle_guc if kutle_yon else 0.0)
 
     def isle(self, frame_bgr):
         o = Olcum()
@@ -400,12 +455,26 @@ class Dedektor:
 
         yon, kosu = self._kose_analiz(maske, merkezler)
         o.kosu_px = kosu
+
         # 3. KANIT: gerçek 90 köşede çizgi köşeye kadar DÜZDÜR, sonra aniden
         # yana kırılır. Yumuşak yayda ise noktalar zaten eğridir. Doğruya göre
         # artık büyükse (= yay) köşe kabul etmiyoruz -- yayda sahte 90 dönüş
         # yapmak görevi bitirir.
+        # DİKKAT: bu kapı, kose_ipucu YAZILMADAN ÖNCE uygulanmalı. Aksi halde
+        # dar yayda ipucu üretiliyor ve çizgi bir an kaybolduğunda araç
+        # "köşe var" sanıp pivota giriyordu.
         if artik_px > KOSE_MAX_ARTIK:
             yon = 0
+
+        # 4. KANIT: gerçek 90 köşede önümüzdeki DİKEY ÇİZGİ BİTER, yani kayan
+        # pencere zinciri tepeye ulaşamaz. Yumuşak/dar yayda ise zincir dolu
+        # kalır. Kapalı çevrimde ölçüldü:
+        #     dar yay R=55 : duzluk 2.90-3.34   kosu_px 47-69   zincir 7/8
+        #     gerçek köşe  : duzluk 0.00-2.30   kosu_px 71-77   zincir 6..2
+        # Bu iki koşul birlikte ikisini iki bağımsız paydan ayırıyor.
+        if len(merkezler) > PENCERE_SAYISI - KOSE_MIN_KISALMA:
+            yon = 0
+        o.kose_ipucu = yon
         self._kose_gecmis.append(yon)
         if len(self._kose_gecmis) > KOSE_ONAY_KARE:
             self._kose_gecmis.pop(0)
@@ -514,6 +583,8 @@ son_gecerli = time.monotonic()
 qr_soguma = 0.0
 pivot_yon = 0
 kose_taban_t = None
+kose_ipucu_yon = 0
+kose_ipucu_t = 0.0
 arama_yonu = +1
 fps = 0.0
 
@@ -560,13 +631,25 @@ try:
         o = dedektor.isle(frame)
         if o.gecerli:
             son_gecerli = simdi
+        if o.kose_ipucu != 0:
+            kose_ipucu_yon, kose_ipucu_t = o.kose_ipucu, simdi
 
         sure = simdi - t_durum
 
         # ---------------------------------------------------------- CIZGI_TAKIP
         if DURUM == "CIZGI_TAKIP":
             if not o.gecerli:
-                if simdi - son_gecerli > CIZGI_KAYIP_SURE:
+                # Çizgiyi kaybettiğimiz anda YAKIN GEÇMİŞTE köşe ipucu varsa
+                # durmak yanlıştır: keskin 90 derece köşede önümüzdeki dikey
+                # çizgi zaten bitmiştir. Doğru davranış, köşeye kadar ilerleyip
+                # dönmektir. (Belirti tam buydu: "90 gelince çizgi kaybediyor".)
+                if (kose_ipucu_yon != 0
+                        and simdi - kose_ipucu_t < KOSE_IPUCU_OMRU):
+                    pivot_yon = kose_ipucu_yon
+                    kose_taban_t = simdi          # köşe zaten kör bölgeye girdi
+                    gec("VIRAJ_ILERI",
+                        f"çizgi bitti + {'sağ' if pivot_yon > 0 else 'sol'} köşe ipucu")
+                elif simdi - son_gecerli > CIZGI_KAYIP_SURE:
                     motor_sur(NOTR, NOTR)
                     pid.sifirla()
                     gec("ARAMA", "çizgi kayboldu")
@@ -706,9 +789,17 @@ try:
                 renk = (60, 60, 235)
             cv2.putText(g, f"{DURUM}  guven {o.guven:.2f}  {fps:.0f}fps", (5, 16),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, renk, 1)
+            # kosu_px'i her zaman göster: KOSE_KOSU_PX eşiğini araçta gözle
+            # ayarlayabilmek için. Köşeye gelince bu sayı fırlamalı.
+            cv2.putText(g, f"kosu {o.kosu_px:4.0f}px  (esik {KOSE_KOSU_PX})",
+                        (5, 64), cv2.FONT_HERSHEY_SIMPLEX, 0.42,
+                        (220, 80, 200) if o.kose_ipucu else (170, 170, 170), 1)
             if o.kose_yonu:
                 cv2.putText(g, f"KOSE {'SAG' if o.kose_yonu > 0 else 'SOL'}", (5, 50),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (220, 80, 200), 2)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (220, 80, 200), 2)
+            elif o.kose_ipucu:
+                cv2.putText(g, f"kose? {'sag' if o.kose_ipucu > 0 else 'sol'}", (5, 50),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (150, 100, 200), 1)
             cv2.imshow("RoboVizyon - kamera", g)
             if o.maske is not None:
                 cv2.imshow("maske", cv2.resize(o.maske, (320, 240),
