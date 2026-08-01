@@ -122,7 +122,8 @@ class MotorAyar:
     notr: int = 2048
     # Nötre göre tam gaz ofseti. hiz_max_cm_s bu ofsete karsilik gelir.
     tam_gaz_ofset: int = 900
-    yon: int = +1                         # +1: DAC > notr ileri | -1: tersi
+    yon: int = -1                         # +1: DAC > notr ileri | -1: tersi
+                                          # BENCH TESTI: arac ters gitti -> -1
     pivot_ofset: int = 700
     komut_hz: float = 50.0
 
