@@ -96,7 +96,12 @@ YON = -1        # <<< araç ters gittiği için çevrildi
 # BESLEME demektir: araç çizgiden UZAĞA direksiyon kırıyor. Kontrol matematiği
 # doğruysa geriye iki fiziksel sebep kalır ve ikisi de tek bayrakla düzelir.
 # Hangisi olduğunu `python3 teshis.py` söyler.
-MOTOR_TAKAS = False   # True: 0x60 fiziksel SAĞ tekere bağlıysa (sol/sağ takas)
+MOTOR_TAKAS = True    # KANITLANDI: motorlar fiziksel olarak TAKAS bağlı.
+                      # Eski kodun direksiyon işareti de tersti; iki hata
+                      # birbirini götürdüğü için o kod "az da olsa" çalışıyordu.
+                      # Simülasyon: normal bağlı varsayımıyla araç 14 cm'de
+                      # takılıyor, takas varsayımıyla 284 cm'yi -1.8 mm ile
+                      # gidiyor.
 KAMERA_AYNA = False   # True: kamera ayna görüntü veriyorsa (yatay çevir)
 KAMERA_TERS = False   # True: kamera 180 derece ters monteyse
 # ----------------------------------------------------------------------------

@@ -77,7 +77,10 @@ def kosu(ad, pist, baslangic, isik, gurultu, sure=26.0):
             except Exception:
                 sol = sag = 2048
             v = lambda d: ((d - 2048) / yon) / 900.0 * HIZ_MAX
-            arac.adim(v(sol), v(sag), DT)
+            # GERCEK DONANIM: motorlar fiziksel olarak takas bagli.
+            # Kod MOTOR_TAKAS=True ile zaten cevirdigi icin burada geri ceviriyoruz
+            # -- yani simulator gercek arabayi taklit ediyor.
+            arac.adim(v(sag), v(sol), DT)
         saat["t"] += DT
         if m is not None:
             durumlar.append(getattr(m, "DURUM", "?"))
