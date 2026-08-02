@@ -6,8 +6,9 @@ Sentetik bayt akisi uretip surucunun dogru cozdugunu dogrular.
 Gercek cihaza takmadan once bunu calistir:  python3 test_c1.py
 """
 
-import sys
 import os
+import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import c1
@@ -85,6 +86,7 @@ class SahteSeri:
         self.veri = bytes([0xAB] * kayma) + veri
         self.i = 0
         self.dtr = False
+        self.rts = True
         self.is_open = True
         self.yazilan = bytearray()
 
@@ -122,9 +124,10 @@ for kayma in (0, 1, 3):
     lid = c1.RPLidarC1.__new__(c1.RPLidarC1)      # __init__ atla (port yok)
     lid.ser = SahteSeri(ham, kayma=kayma)
     lid._tarama_acik = True
+    lid._on_tampon = bytearray()
 
     okunan = []
-    ureteci = lid.olcumler()
+    ureteci = lid.olcumler(sessizlik=0.05)
     try:
         for _ in range(len(beklenen) - 1):        # kayma birkac olcumu yer
             okunan.append(next(ureteci))
@@ -151,6 +154,7 @@ for tur in range(3):
 lid = c1.RPLidarC1.__new__(c1.RPLidarC1)
 lid.ser = SahteSeri(bytes(ham))
 lid._tarama_acik = True
+lid._on_tampon = bytearray()
 
 turlar = []
 try:
@@ -173,6 +177,7 @@ print("=" * 62)
 lid = c1.RPLidarC1.__new__(c1.RPLidarC1)
 lid.ser = SahteSeri(b"")
 lid._tarama_acik = False
+lid._on_tampon = bytearray()
 lid._komut(c1.KOMUT_SCAN)
 kontrol("SCAN komutu A5 20", bytes(lid.ser.yazilan) == b"\xA5\x20",
         lid.ser.yazilan.hex().upper())
@@ -180,6 +185,170 @@ lid.ser.yazilan.clear()
 lid._komut(c1.KOMUT_STOP)
 kontrol("STOP komutu A5 25", bytes(lid.ser.yazilan) == b"\xA5\x25",
         lid.ser.yazilan.hex().upper())
+
+print("\n" + "=" * 62)
+print(" 6. TARAMA BASLATMA  --  'kabul etti ama veri yok' yakalaniyor mu")
+print("=" * 62)
+c1.HAT_OTURMA_S = 0.0            # testte hat oturma beklemesi gereksiz
+
+
+class SahteCihaz:
+    """Komutlara cevap veren sahte C1.
+
+    calisan_hat: olcum gonderdigi (dtr, rts) ikilisi. None = her zaman gonderir,
+                 (-1,-1) gibi eslesmeyen bir deger = HIC gondermez (motor donmuyor).
+    scan_tanim : SCAN'e tanimlayici verilsin mi.
+    """
+    def __init__(self, calisan_hat=None, scan_tanim=True):
+        self.calisan_hat = calisan_hat
+        self.scan_tanim = scan_tanim
+        self.dtr = True
+        self.rts = True
+        self.is_open = True
+        self.cikti = bytearray()
+        self.tarama = False
+        self.sayac = 0
+        self.stop_sayisi = 0
+        self.scan_sayisi = 0
+
+    # -- cihaz tarafi ------------------------------------------------------
+    def _uretir_mi(self):
+        return self.tarama and (self.calisan_hat is None
+                                or (self.dtr, self.rts) == self.calisan_hat)
+
+    def _besle(self):
+        if self._uretir_mi() and len(self.cikti) < 400:
+            for _ in range(80):
+                self.cikti += olcum_kodla(self.sayac % 500 == 0, 40,
+                                          (self.sayac * 0.72) % 360.0, 1500.0)
+                self.sayac += 1
+
+    # -- pyserial arayuzu --------------------------------------------------
+    @property
+    def in_waiting(self):
+        self._besle()
+        return len(self.cikti)
+
+    def read(self, n=1):
+        self._besle()
+        d = bytes(self.cikti[:n])
+        del self.cikti[:len(d)]
+        return d
+
+    def write(self, b):
+        if b == c1.BAYRAK + c1.KOMUT_SCAN:
+            self.scan_sayisi += 1
+            self.tarama = True
+            if self.scan_tanim:
+                self.cikti += b"\xA5\x5A\x05\x00\x00\x40\x81"
+        elif b == c1.BAYRAK + c1.KOMUT_STOP:
+            self.stop_sayisi += 1
+            self.tarama = False
+            self.cikti.clear()
+        return len(b)
+
+    def reset_input_buffer(self):
+        self.cikti.clear()
+
+    def close(self):
+        self.is_open = False
+
+
+def lidar_kur(cihaz):
+    lid = c1.RPLidarC1.__new__(c1.RPLidarC1)
+    lid.ser = cihaz
+    lid._tarama_acik = False
+    lid._on_tampon = bytearray()
+    lid.motor_hatti = (False, True)
+    return lid
+
+
+# --- 6a: motor hic donmuyor -> tanimlayici gelir ama olcum gelmez ---
+cihaz = SahteCihaz(calisan_hat=(None, None))       # hicbir hatta veri yok
+lid = lidar_kur(cihaz)
+try:
+    lid.tarama_baslat(bekleme=0.1)
+    kontrol("veri yokken hata veriliyor", False, "sessizce gecti")
+except c1.VeriYokHatasi as e:
+    metin = str(e)
+    kontrol("veri yokken VeriYokHatasi", True)
+    kontrol("hata mesaji motoru/beslemeyi isaret ediyor",
+            "MOTOR DONMUYOR" in metin and "USB" in metin)
+except c1.LidarHatasi as e:
+    kontrol("veri yokken VeriYokHatasi", False, f"yanlis tur: {e}")
+kontrol("tum motor hatti kombinasyonlari denendi",
+        cihaz.scan_sayisi >= len(c1.MOTOR_HATTI_DENEMELERI),
+        f"{cihaz.scan_sayisi} SCAN denemesi")
+
+# --- 6b: sadece 3. kombinasyonda veri var -> onu bulmali ---
+hedef = c1.MOTOR_HATTI_DENEMELERI[2]
+cihaz = SahteCihaz(calisan_hat=hedef)
+lid = lidar_kur(cihaz)
+try:
+    lid.tarama_baslat(bekleme=0.1)
+    kontrol("dogru motor hatti bulundu", lid.motor_hatti == hedef,
+            f"DTR={lid.motor_hatti[0]} RTS={lid.motor_hatti[1]}")
+    kontrol("tarama acik isaretlendi", lid._tarama_acik)
+except c1.LidarHatasi as e:
+    kontrol("dogru motor hatti bulundu", False, str(e).splitlines()[0])
+
+# --- 6c: on tampondaki baytlar kaybolmuyor ---
+cihaz = SahteCihaz(calisan_hat=None)
+lid = lidar_kur(cihaz)
+lid.tarama_baslat(bekleme=0.1)
+on = len(lid._on_tampon)
+okunan = [x for _, x in zip(range(40), lid.olcumler(sessizlik=0.2))]
+kontrol("SCAN sonrasi ilk baytlar tampona alindi", on > 0, f"{on} bayt")
+kontrol("on tampondan olcum cozuluyor", len(okunan) == 40,
+        f"{len(okunan)} olcum")
+kontrol("mesafeler dogru cozuldu",
+        all(abs(m - 1500.0) < 0.3 for _, _, _, m in okunan))
+
+print("\n" + "=" * 62)
+print(" 7. KISA SESSIZLIKTE PES ETMEME")
+print("=" * 62)
+
+
+class KesintiliSeri(SahteSeri):
+    """Ilk N okumada bos doner (motor hizlanirken olan sey), sonra veri verir."""
+    def __init__(self, veri, bos_okuma=8):
+        super().__init__(veri)
+        self.kalan_bos = bos_okuma
+        self.bos_sayisi = 0
+
+    def read(self, n=1):
+        if self.kalan_bos > 0:
+            self.kalan_bos -= 1
+            self.bos_sayisi += 1
+            return b""
+        return super().read(n)
+
+
+ham, beklenen = akis_uret(30)
+lid = c1.RPLidarC1.__new__(c1.RPLidarC1)
+lid.ser = KesintiliSeri(ham, bos_okuma=8)
+lid._tarama_acik = True
+lid._on_tampon = bytearray()
+try:
+    okunan = [x for _, x in zip(range(20), lid.olcumler(sessizlik=5.0))]
+    kontrol("bos okumalar hata saymiyor", len(okunan) == 20,
+            f"{lid.ser.bos_sayisi} bos okuma atlatildi, {len(okunan)} olcum")
+except c1.LidarHatasi as e:
+    kontrol("bos okumalar hata saymiyor", False, str(e).splitlines()[0])
+
+# Sessizlik suresi asilirsa hata VERMELI (sonsuz beklemek de yanlis)
+lid = c1.RPLidarC1.__new__(c1.RPLidarC1)
+lid.ser = SahteSeri(b"")
+lid._tarama_acik = True
+lid._on_tampon = bytearray()
+t0 = time.monotonic()
+try:
+    next(lid.olcumler(sessizlik=0.3))
+    kontrol("sessizlik asilinca hata veriliyor", False, "hata gelmedi")
+except c1.VeriYokHatasi:
+    gecen = time.monotonic() - t0
+    kontrol("sessizlik asilinca hata veriliyor", 0.25 < gecen < 2.0,
+            f"{gecen:.2f} sn sonra")
 
 print("\n" + "=" * 62)
 print(f" GECTI: {GECTI}    BASARISIZ: {BASARISIZ}")

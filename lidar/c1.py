@@ -46,9 +46,27 @@ YANIT_BASI = b"\xA5\x5A"
 
 SAGLIK_METIN = {0: "iyi", 1: "uyari", 2: "hata"}
 
+# USB adaptorunde motoru/enable'i hangi el sikisma hattinin surdugu karta gore
+# degisir. A serisi adaptorde DTR=False motoru CALISTIRIR; C1 ile gelen yeni
+# adaptorlerde bu hat bagli olmayabilir ya da ters olabilir. Bu yuzden tek bir
+# kombinasyona guvenmiyoruz -- sirayla deneyip veri geleni seciyoruz.
+MOTOR_HATTI_DENEMELERI = [
+    (False, True),      # A serisi adaptorun bilinen "motor calis" hali
+    (False, False),
+    (True, True),
+    (True, False),
+]
+
+# DTR/RTS degistirmek bazi USB adaptorlerinde LiDAR'i resetler; bu kadar bekle.
+HAT_OTURMA_S = 0.6
+
 
 class LidarHatasi(Exception):
     pass
+
+
+class VeriYokHatasi(LidarHatasi):
+    """SCAN kabul edildi ama olcum gelmedi -- neredeyse her zaman motor/besleme."""
 
 
 def olcum_coz(bes_bayt):
@@ -79,15 +97,61 @@ class RPLidarC1:
         self.ser = serial.Serial(port, baud, timeout=zaman_asimi,
                                  parity=serial.PARITY_NONE,
                                  stopbits=serial.STOPBITS_ONE)
-        # A1'de DTR motoru durdurur. C1'de etkisiz ama zararsiz -- garanti olsun.
-        self.ser.dtr = False
+        # A1'de DTR=False motoru calistirir. C1 adaptorunde bagli olmayabilir;
+        # veri gelmezse tarama_baslat() diger kombinasyonlari da dener.
+        self.motor_hatti = (False, True)
+        self._hat_ayarla(*self.motor_hatti)
         self._tarama_acik = False
+        self._on_tampon = bytearray()
         time.sleep(0.1)
         self.ser.reset_input_buffer()
 
     # -------------------------------------------------------------- dusuk seviye
     def _komut(self, kod):
         self.ser.write(BAYRAK + kod)
+
+    def _hat_ayarla(self, dtr, rts):
+        """DTR/RTS el sikisma hatlarini surer. Bazi suruculer destelemez -- yut."""
+        degisti = False
+        for ad, deger in (("dtr", dtr), ("rts", rts)):
+            try:
+                if getattr(self.ser, ad) != deger:
+                    setattr(self.ser, ad, deger)
+                    degisti = True
+            except Exception:
+                pass
+        if degisti:
+            time.sleep(HAT_OTURMA_S)
+
+    def _veri_bekle(self, sure=3.0, yeter=20):
+        """En fazla `sure` saniye ham bayt toplar. `yeter` bayt gelince erken doner.
+
+        Bloklayan read() yerine in_waiting ile bekliyoruz ki sure kesin olsun.
+        """
+        bitis = time.monotonic() + sure
+        toplam = bytearray()
+        while time.monotonic() < bitis:
+            n = self.ser.in_waiting
+            if n:
+                toplam.extend(self.ser.read(n))
+                if len(toplam) >= yeter:
+                    break
+            else:
+                time.sleep(0.02)
+        return bytes(toplam)
+
+    def _temiz_baslat(self):
+        """STOP gonder, cihazin sakinlesmesini bekle, tamponu bosalt."""
+        try:
+            self._komut(KOMUT_STOP)
+        except Exception:
+            pass
+        self._tarama_acik = False
+        time.sleep(0.1)
+        try:
+            self.ser.reset_input_buffer()
+        except Exception:
+            pass
 
     def _tanimlayici_oku(self):
         """7 baytlik yanit tanimlayicisi. (uzunluk, mod, tip) doner."""
@@ -130,32 +194,92 @@ class RPLidarC1:
                 "hata_kodu": hata_kodu}
 
     # ------------------------------------------------------------------ tarama
-    def tarama_baslat(self):
-        self.ser.reset_input_buffer()
+    def _scan_dene(self, bekleme):
+        """Bir kez SCAN gonderir, tanimlayiciyi okur, GERCEKTEN bayt geldigini olcer.
+
+        Doner: gelen ham baytlar (bos ise veri akmiyor demektir).
+        """
+        self._temiz_baslat()
         self._komut(KOMUT_SCAN)
         uzunluk, mod, tip = self._tanimlayici_oku()
         if uzunluk != 5:
             raise LidarHatasi(f"beklenmeyen olcum boyu: {uzunluk}")
-        self._tarama_acik = True
+        return self._veri_bekle(bekleme)
 
-    def olcumler(self, max_kotu=1000):
+    def tarama_baslat(self, bekleme=3.0, motor_dene=True):
+        """SCAN baslatir ve olcumlerin GERCEKTEN aktigini dogrular.
+
+        Eski surum sadece tanimlayiciya bakiyordu: cihaz "tamam, 5 baytlik
+        olcumler gonderecegim" der, motor donmedigi icin tek bayt bile
+        gondermez, hata ancak ilk okumada ve yanlis isimle ("zaman asimi")
+        patlardi. Artik burada yakaliyoruz ve motor hatlarini da deniyoruz.
+        """
+        self._on_tampon = bytearray()
+        denemeler = [tuple(self.motor_hatti)]
+        if motor_dene:
+            for k in MOTOR_HATTI_DENEMELERI:
+                if k not in denemeler:
+                    denemeler.append(k)
+
+        for dtr, rts in denemeler:
+            try:
+                # Ilk denemede de uygula: aksi halde port acilirken kalan hat
+                # durumu ile calisip yanlis kombinasyonu "calisan" diye kaydederiz.
+                self._hat_ayarla(dtr, rts)
+                ham = self._scan_dene(bekleme)
+            except LidarHatasi:
+                ham = b""
+            if ham:
+                self._on_tampon = bytearray(ham)
+                self.motor_hatti = (dtr, rts)
+                self._tarama_acik = True
+                return
+            self._temiz_baslat()
+
+        # Hicbir kombinasyonda tek bayt gelmedi -> yazilim sorunu degil.
+        self._hat_ayarla(*MOTOR_HATTI_DENEMELERI[0])
+        raise VeriYokHatasi(
+            "LiDAR komutu kabul ediyor ama OLCUM GONDERMIYOR.\n"
+            "  Cihaz konusuyor (model/saglik okundu), demek ki port ve baud DOGRU.\n"
+            "  Olcum gelmemesinin tek sebebi neredeyse her zaman MOTOR DONMUYOR:\n"
+            "    1. LiDAR'in kafasi eline yaklastirinca donuyor mu? Ses geliyor mu?\n"
+            "       Donmuyorsa USB yeterli akim vermiyor.\n"
+            "    2. BASKA BIR USB PORTA TAK. Masaustunde ARKA paneldeki portlar,\n"
+            "       dizustunde sarj takiliyken denenmeli. USB hub kullanma.\n"
+            "    3. Kablo: veri kablosu oldugundan emin ol (bazi kablolar sadece sarj).\n"
+            "    4. Adaptorde ayri 5V girisi varsa oradan besle.\n"
+            "  Detayli test icin:  python tanila.py")
+
+    def olcumler(self, max_kotu=1000, sessizlik=2.5):
         """Sonsuz olcum ureteci: (yeni_tur, kalite, aci, mesafe).
 
         Bozuk bayt gelirse 1 bayt kaydirip yeniden hizalanir -- gercek
         kullanimda seri hattinda tek bayt kaymasi olur ve sabit boyutlu
         okuma yapan kod bir daha ASLA duzelemez.
+
+        sessizlik: bu kadar saniye HIC bayt gelmezse hata verir. Tek bir bos
+        read()'te patlamiyoruz; motor yavaslamasi/USB gecikmesi normaldir.
         """
         if not self._tarama_acik:
             self.tarama_baslat()
-        tampon = bytearray()
+        tampon = bytearray(self._on_tampon)
+        self._on_tampon = bytearray()
         kotu = 0
+        son_veri = time.monotonic()
         while True:
             gerek = 5 - len(tampon)
             if gerek > 0:
                 yeni = self.ser.read(max(gerek, self.ser.in_waiting or gerek))
-                if not yeni:
-                    raise LidarHatasi("veri gelmiyor (zaman asimi)")
-                tampon.extend(yeni)
+                if yeni:
+                    tampon.extend(yeni)
+                    son_veri = time.monotonic()
+                elif time.monotonic() - son_veri > sessizlik:
+                    raise VeriYokHatasi(
+                        "veri kesildi -- LiDAR sustu.\n"
+                        "  Kafa donmeyi birakti (besleme dusuk) ya da USB kablosu oynadi.\n"
+                        "  Baska bir USB porta tak, sonra tekrar dene.")
+                else:
+                    continue
             while len(tampon) >= 5:
                 try:
                     sonuc = olcum_coz(tampon[:5])
@@ -187,6 +311,7 @@ class RPLidarC1:
     def durdur(self):
         self._komut(KOMUT_STOP)
         self._tarama_acik = False
+        self._on_tampon = bytearray()
         time.sleep(0.01)
         self.ser.reset_input_buffer()
 

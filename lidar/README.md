@@ -1,12 +1,48 @@
 # RPLIDAR C1 — başlangıç
 
 ```
+basla.py        Sıfırdan başlatan tek dosya — ne yapacağını bilmiyorsan BUNU çalıştır
+tanila.py       Teşhis — veri gelmiyorsa BUNU çalıştır, sorunu söyler
 c1.py           Bağımsız sürücü (sadece pyserial). ROS gerekmez.
 goster.py       Canlı görünüm / kayıt / oynatma / sentetik oda
 harita.py       2D harita: tek tarama + gezerek (ICP-SLAM)
-test_c1.py      Protokol testi — LİDAR OLMADAN çalışır (16 kontrol)
+test_c1.py      Protokol testi — LİDAR OLMADAN çalışır (26 kontrol)
 test_harita.py  ICP/SLAM testi — LİDAR OLMADAN çalışır (20 kontrol)
 ```
+
+## ⚠ "Bağlanıyor ama veri gelmiyor"
+
+```
+[BILGI]  {'model': 65, 'yazilim': '1.2', ...}
+[SAGLIK] iyi (kod 0)
+[HATA]   veri gelmiyor
+```
+
+**Bu tablo teşhisin tamamı:**
+
+| Ne oldu | Ne demek |
+|---|---|
+| Model + seri no okundu | Port, baud (460800) ve kablo **doğru** |
+| Sağlık "iyi" | Cihazın elektroniği **sağlam** |
+| SCAN kabul edildi, ölçüm yok | **Kafa dönmüyor** → USB yeterli akım vermiyor |
+
+Ölçüm yalnızca kafa dönerken üretilir. Motor stall olursa cihaz komutlara
+cevap vermeye devam eder ama tek bayt ölçüm göndermez — tam olarak bu tablo.
+
+```bash
+python tanila.py            # hangi aşamada takıldığını satır satır söyler
+```
+
+`tanila.py` DTR/RTS motor hattının 4 kombinasyonunu da dener, gelen ham baytı
+sayar ve `tanila_cikti.txt` yazar. Sırasıyla dene, her adımdan sonra tekrar
+çalıştır:
+
+1. **Başka bir USB porta tak** — masaüstünde kasanın **arka** paneli
+   (anakart üzeri), dizüstünde **şarj takılıyken**. Hub/uzatma varsa çıkar.
+2. **Kabloyu değiştir** — ince damarlı "sadece şarj" kabloları motor akımında
+   gerilim düşürür.
+3. Adaptörde ayrı **5V girişi** varsa oradan besle.
+4. Kafanın önünde nakliye bandı / koruyucu köpük varsa **çıkar**.
 
 ## Cihaz (Slamtec RPLIDAR C1)
 
@@ -28,7 +64,7 @@ test_harita.py  ICP/SLAM testi — LİDAR OLMADAN çalışır (20 kontrol)
 ```bash
 pip install pyserial opencv-python numpy
 
-python3 test_c1.py                  # 1) donanımsız protokol testi -> 16/16
+python3 test_c1.py                  # 1) donanımsız protokol testi -> 26/26
 python3 goster.py --sahte           # 2) sentetik oda, arayüzü tanı
 python3 goster.py                   # 3) LiDAR'ı USB'ye tak, canlı gör
 ```

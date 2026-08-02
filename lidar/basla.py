@@ -41,14 +41,14 @@ def bekle():
 #  ADIM 0 -- dosyalar yerinde mi
 # ============================================================================
 baslik("ADIM 0/4  --  Dosyalar kontrol ediliyor")
-GEREKLI = ["c1.py", "goster.py", "harita.py"]
+GEREKLI = ["c1.py", "goster.py", "harita.py", "tanila.py"]
 eksik_dosya = [d for d in GEREKLI if not os.path.exists(os.path.join(KLASOR, d))]
 if eksik_dosya:
     print(f"  [HATA] Su dosyalar eksik: {', '.join(eksik_dosya)}")
     print(f"  Hepsi su klasorde olmali:\n     {KLASOR}")
     bekle()
     sys.exit(1)
-print("  OK  c1.py, goster.py, harita.py bulundu")
+print(f"  OK  {', '.join(GEREKLI)} bulundu")
 
 
 # ============================================================================
@@ -153,13 +153,32 @@ if lidar is None:
     bekle()
     sys.exit(1)
 
-# Baglanti dogrulandi, portu birak (alt programlar kendisi acacak)
-lidar.kapat()
-
 
 # ============================================================================
-#  ADIM 4 -- ne yapmak istiyorsun
+#  ADIM 3b -- VERI GERCEKTEN AKIYOR MU
+# ----------------------------------------------------------------------------
+#  Cihazin cevap vermesi yetmez. "Model okundu, saglik iyi" deyip sonra
+#  goruntu penceresinde patlamak en can sikici hata. Menuye girmeden once
+#  gercek olcum alip alamadigimizi burada olcuyoruz.
 # ============================================================================
+print("\n  Tarama verisi kontrol ediliyor (birkac saniye)...")
+veri_akiyor = False
+try:
+    lidar.tarama_baslat()
+    n = 0
+    for _ in lidar.olcumler():
+        n += 1
+        if n >= 30:
+            break
+    veri_akiyor = True
+    d, r = lidar.motor_hatti
+    print(f"  OK  VERI AKIYOR  (motor hatti DTR={d} RTS={r})")
+except Exception as e:
+    print(f"\n  [SORUN] Olcum alinamiyor:\n  {e}")
+
+lidar.kapat()   # portu birak, alt programlar kendisi acacak
+
+
 def calistir(betik, *arg):
     komut = [sys.executable, os.path.join(KLASOR, betik), "--port", secili, *arg]
     print(f"\n  > {' '.join(komut[1:])}\n")
@@ -167,6 +186,21 @@ def calistir(betik, *arg):
         subprocess.call(komut)
     except KeyboardInterrupt:
         pass
+
+
+if not veri_akiyor:
+    print("\n" + CIZGI)
+    print("  Teshis programi calistiriliyor -- sorunun ne oldugunu soyleyecek.")
+    print(CIZGI)
+    calistir("tanila.py")
+    print("\n  Teshisi okudun mu? Yukaridaki adimlari uygulayip bu dosyayi")
+    print("  tekrar calistir. Yine de menuye girmek istersen devam et.")
+    bekle()
+
+
+# ============================================================================
+#  ADIM 4 -- ne yapmak istiyorsun
+# ============================================================================
 
 
 while True:
@@ -182,6 +216,8 @@ while True:
    (SLAM)                  harita buyuye buyuye olussun
 
    4  KAYIT AL             gez, kaydet -> sonra robotsuz tekrar incele
+
+   5  TESHIS               veri gelmiyorsa / bir sey ters giderse BUNU CALISTIR
 
    0  CIKIS
 """)
@@ -217,9 +253,11 @@ while True:
         print(f"\n  Kaydedildi: {ad}.npz")
         print(f"  Sonra harita cikarmak icin:")
         print(f"     python harita.py --oynat {ad}.npz --slam")
+    elif s == "5":
+        calistir("tanila.py")
     elif s == "0":
         break
     else:
-        print("  1, 2, 3, 4 veya 0 yaz.")
+        print("  1, 2, 3, 4, 5 veya 0 yaz.")
 
 print("\n  Bitti.")
