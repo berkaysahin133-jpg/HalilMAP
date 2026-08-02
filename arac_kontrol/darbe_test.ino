@@ -2,30 +2,52 @@
    DARBE TEST  --  bir pinde hiz/tako darbesi var mi, tur basina kac darbe?
 
    Ne ise yarar:
-     Kelly surucusunun konnektorunde "speed / meter / tacho / pulse / hall out"
-     benzeri bir cikis olabilir. Kilavuzdan hangi pin oldugunu bulunca BU KODLA
-     dogrularsin: darbe geliyor mu, tur basina kac tane, yon bilgisi var mi.
-     Ayni kod motorun hall sensorune paralel baglandiginda da calisir.
+     Kelly KLS-S'te motorun hall sensorunu KOPYALAYAN bir cikis var. Kilavuz
+     (KLS-S User Manual V1.10, bolum 3.2.1 "Pin definition"):
+
+         DJ7091Y-2.3-21 Pin Definition
+         (8) Meter: Copy signal of hall sensors.   Dark Gray
+         Notes: 2. Meter function is to copy either of hall sensors.
+
+     Yani motorun hall soketine HIC DOKUNMADAN, gaz konnektorunun uzerindeki
+     KOYU GRI telden tek hall fazinin sinyalini alabilirsin. Bu kod o telde
+     gercekten darbe var mi ve tur basina kac tane oldugunu olcer.
+     Ayni kod hall sensorune paralel baglandiginda da calisir.
+
+   BEKLENEN SONUC (hoverboard hub motoru, 15 kutup cifti):
+     Meter tek faz kopyaladigi icin elektriksel turda 2 kenar
+     -> 15 x 2 = TUR BASINA ~30 kenar (CHANGE ile)
+     -> 6.5 inc teker (518 mm cevre) icin ~17 mm/darbe
+     Cok farkli bir sayi cikarsa motorun kutup cifti sayisi farklidir.
+
+   DIKKAT -- KABLO RENGI TUZAGI:
+     (8)  Meter     = KOYU GRI  (Dark Gray)
+     (15) Micro_SW  = GRI       (Gray)
+     Ikisi karisir. Renge guvenme, asagidaki multimetre testiyle dogrula:
+     tekerlegi elle cevirdiginde oynayan tel Meter'dir.
 
    ---------------------------------------------------------------------------
    ONCE MULTIMETRE  --  Arduino'yu yakmadan once bunu yap
    ---------------------------------------------------------------------------
-     1. Kelly'yi calistir, tekerlegi ELLE yavasca cevir.
-     2. Aday pin ile GND arasini DC voltta olc.
-     3. 0-5 V arasi oynuyorsa  -> guvenli, dogrudan bagla.
+     1. Kelly'yi calistir (gaz verme), tekerlegi ELLE yavasca cevir.
+     2. Aday tel ile RTN (siyah) arasini DC voltta olc.
+     3. 0-5 V arasi oynuyorsa  -> Meter bu, guvenli, dogrudan bagla.
         5 V'un USTUNDE ise     -> DOGRUDAN BAGLAMA. Once gerilim bolucu:
-                                  sinyal --[10k]--+--[10k]-- GND
+                                  sinyal --[10k]--+--[4k7]-- RTN
                                                   |
-                                               Arduino pini      (12V -> 6V,
-                                  12 V icin 10k/4.7k daha iyi: 12 -> 3.8 V)
-     4. Hic oynamiyorsa -> yanlis pin, listedeki digerini dene.
+                                               Arduino pini     (12 V -> 3.8 V)
+     4. Hic oynamiyorsa -> yanlis tel, digerini dene.
 
    ---------------------------------------------------------------------------
    BAGLANTI
    ---------------------------------------------------------------------------
-     Aday sinyal 1  -> D2
-     Aday sinyal 2  -> D3        (ikinci bir pini ayni anda denemek icin)
-     Kelly GND      -> Arduino GND     <-- ORTAK TOPRAK SART, unutma
+     SOL  Kelly, pin 8 (Meter, koyu gri)  -> D2
+     SAG  Kelly, pin 8 (Meter, koyu gri)  -> D3
+     Kelly RTN (siyah, pin 20)            -> Arduino GND
+                                             <-- ORTAK TOPRAK SART, unutma
+
+     Not: Meter tek faz kopyaladigi icin YON bilgisi vermez. Yonu zaten sen
+     biliyorsun (DAC'a yazdigin degerin isareti), darbeleri o isaretle say.
 
    ---------------------------------------------------------------------------
    KULLANIM  (Seri Monitor, 115200)
@@ -37,9 +59,10 @@
         Tur basina darbe sayisini yazar. Odometri icin gereken sayi budur.
 
    Beklenen sonuclar:
-     hall sensorune paralel, tek hat  -> tur basina ~30 darbe (CHANGE ile)
-     Kelly tako cikisi                -> genelde cok daha az (1-15)
-     hicbir sey                       -> 0, baska pin dene
+     Kelly Meter pini (pin 8)         -> tur basina ~30 darbe, ~17 mm/darbe
+     hall sensorune paralel, tek hat  -> ayni: ~30 darbe
+     hall sensorune paralel, 3 hat    -> ~90 darbe, ~5.8 mm/darbe (en iyisi)
+     hicbir sey                       -> 0, yanlis tel ya da ortak toprak yok
    =========================================================================== */
 
 const uint8_t PIN_A = 2;              // Uno/Nano/Mega: D2 ve D3 kesme pinidir
