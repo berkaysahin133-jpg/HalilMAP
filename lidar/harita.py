@@ -225,6 +225,141 @@ class Izgara:
                        5, (40, 90, 230), -1, cv2.LINE_AA)
         return img
 
+    # ----------------------------------------------------------------- sunum
+    def sunum(self, pozlar=None, baslik="ODA HARITASI", altbilgi="",
+              hedef_px=1400, pay_m=0.6, esik=0.6):
+        """Rapor/sunum icin olculendirilmis harita.
+
+        gorsel() ham izgarayi 1:1 basar: 14 m'lik tuvalin ortasinda 4 m'lik bir
+        oda kucucuk kalir ve duvarlar tek piksel olur. Burada haritanin DOLU
+        oldugu bolgeye kirpip buyutuyoruz, metre izgarasi + olcek + olculer
+        ekliyoruz. Izgara verisine dokunulmuyor, sadece cizim.
+
+        NOT: OpenCV yazi tipleri Turkce karakter basmaz; etiketler ASCII.
+        """
+        if cv2 is None:
+            return self.gorsel(pozlar)
+
+        dolu_m = self.izgara > esik
+        bilinen = dolu_m | (self.izgara < -0.05)
+        if not bilinen.any():
+            return self.gorsel(pozlar)
+
+        # --- haritanin dolu oldugu kare pencereye kirp ---
+        s_i, u_i = np.nonzero(bilinen)
+        pay = int(round(pay_m / self.coz))
+        s0, s1 = s_i.min() - pay, s_i.max() + pay
+        u0, u1 = u_i.min() - pay, u_i.max() + pay
+        k = max(s1 - s0 + 1, u1 - u0 + 1)
+        sm, um = (s0 + s1) // 2, (u0 + u1) // 2          # pencere merkezi
+        s0 = int(np.clip(sm - k // 2, 0, max(0, self.n - k)))
+        u0 = int(np.clip(um - k // 2, 0, max(0, self.n - k)))
+        k = min(k, self.n)
+        alt = self.izgara[s0:s0 + k, u0:u0 + k]
+
+        # --- renklendir, buyut ---
+        harita = np.full((k, k, 3), 168, np.uint8)              # bilinmiyor
+        harita[alt < -0.05] = (250, 250, 250)                   # bos
+        olcek = hedef_px / float(k)                             # piksel / hucre
+        harita = cv2.resize(harita, (hedef_px, hedef_px),
+                            interpolation=cv2.INTER_NEAREST)
+        # Duvarlari buyutulmus goruntude kalinlastir: 1 hucre kalinliginda dursun
+        duvar = (alt > esik).astype(np.uint8) * 255
+        duvar = cv2.resize(duvar, (hedef_px, hedef_px),
+                           interpolation=cv2.INTER_NEAREST)
+        kal = max(2, int(round(olcek * 0.9)))
+        duvar = cv2.dilate(duvar, np.ones((kal, kal), np.uint8))
+        harita[duvar > 0] = (32, 32, 38)
+
+        px_m = olcek / self.coz                                  # piksel / metre
+
+        def ekran(x_m, y_m):
+            """Dunya metre -> sunum goruntusu pikseli."""
+            return (int(round((self.merkez + x_m / self.coz - u0) * olcek)),
+                    int(round((self.merkez - y_m / self.coz - s0) * olcek)))
+
+        # --- metre izgarasi ve etiketler ---
+        x_min = (u0 - self.merkez) * self.coz
+        y_max = (self.merkez - s0) * self.coz
+        for m in range(int(np.ceil(x_min)), int(x_min + k * self.coz) + 1):
+            px, _ = ekran(m, 0)
+            if 0 <= px < hedef_px:
+                cv2.line(harita, (px, 0), (px, hedef_px),
+                         (205, 205, 212), 1 if m else 2, cv2.LINE_AA)
+                cv2.putText(harita, f"{m}m", (px + 4, hedef_px - 8),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.42, (110, 110, 118), 1,
+                            cv2.LINE_AA)
+        for m in range(int(np.ceil(y_max - k * self.coz)), int(y_max) + 1):
+            _, py = ekran(0, m)
+            if 0 <= py < hedef_px:
+                cv2.line(harita, (0, py), (hedef_px, py),
+                         (205, 205, 212), 1 if m else 2, cv2.LINE_AA)
+                cv2.putText(harita, f"{m}m", (6, py - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.42, (110, 110, 118), 1,
+                            cv2.LINE_AA)
+
+        # --- gezilen yol + baslangic/bitis ---
+        if pozlar is not None and len(pozlar) > 1:
+            yol = np.array([ekran(x, y) for x, y, _ in pozlar], np.int32)
+            cv2.polylines(harita, [yol], False, (70, 130, 245), 3, cv2.LINE_AA)
+            cv2.circle(harita, tuple(yol[0]), 9, (90, 175, 90), -1, cv2.LINE_AA)
+            cv2.circle(harita, tuple(yol[-1]), 9, (45, 90, 235), -1, cv2.LINE_AA)
+        else:
+            cv2.circle(harita, ekran(0, 0), 9, (45, 90, 235), -1, cv2.LINE_AA)
+
+        # --- olculer ---
+        nk = self.noktalar(esik=esik)
+        en = float(np.ptp(nk[:, 0])) if len(nk) else 0.0
+        boy = float(np.ptp(nk[:, 1])) if len(nk) else 0.0
+
+        # --- cerceve: baslik ust, aciklama alt ---
+        UST, ALT, YAN = 74, 116, 34
+        tuval = np.full((hedef_px + UST + ALT, hedef_px + 2 * YAN, 3), 255,
+                        np.uint8)
+        tuval[0:UST, :] = (38, 40, 46)
+        tuval[UST:UST + hedef_px, YAN:YAN + hedef_px] = harita
+        cv2.rectangle(tuval, (YAN, UST), (YAN + hedef_px, UST + hedef_px),
+                      (90, 90, 96), 2)
+
+        cv2.putText(tuval, baslik, (YAN, 48), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
+                    (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(tuval, "RPLIDAR C1  |  460800 baud  |  10 Hz",
+                    (tuval.shape[1] - 470, 46), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                    (185, 190, 200), 1, cv2.LINE_AA)
+
+        ty = UST + hedef_px + 34
+        cv2.putText(tuval, f"Olculen alan: {en:.2f} m x {boy:.2f} m",
+                    (YAN, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (25, 25, 30), 2,
+                    cv2.LINE_AA)
+        if altbilgi:
+            cv2.putText(tuval, altbilgi, (YAN, ty + 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (95, 95, 105), 1,
+                        cv2.LINE_AA)
+
+        # --- gosterge (legend) ---
+        lx = YAN + int(hedef_px * 0.42)
+        for i, (renk, yazi) in enumerate([((32, 32, 38), "duvar / engel"),
+                                          ((250, 250, 250), "serbest alan"),
+                                          ((168, 168, 168), "bilinmiyor"),
+                                          ((70, 130, 245), "sensor / yol")]):
+            yy = ty - 14 + (i // 2) * 30
+            xx = lx + (i % 2) * 230
+            cv2.rectangle(tuval, (xx, yy), (xx + 22, yy + 16), renk, -1)
+            cv2.rectangle(tuval, (xx, yy), (xx + 22, yy + 16), (140, 140, 145), 1)
+            cv2.putText(tuval, yazi, (xx + 30, yy + 14),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.46, (55, 55, 62), 1,
+                        cv2.LINE_AA)
+
+        # --- olcek cubugu (1 m) ---
+        bx = tuval.shape[1] - YAN - int(px_m) - 10
+        by = ty + 6
+        cv2.line(tuval, (bx, by), (bx + int(px_m), by), (25, 25, 30), 4)
+        for ux in (bx, bx + int(px_m)):
+            cv2.line(tuval, (ux, by - 8), (ux, by + 8), (25, 25, 30), 3)
+        cv2.putText(tuval, "1 metre", (bx + int(px_m) // 2 - 34, by + 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (25, 25, 30), 1, cv2.LINE_AA)
+        return tuval
+
 
 # ============================================================================
 #  SLAM
@@ -321,6 +456,8 @@ def main():
     ap.add_argument("--coz", type=float, default=0.03, help="hucre boyu (m)")
     ap.add_argument("--ortalama", type=int, default=5,
                     help="--tek modunda kac tarama ortalanacak")
+    ap.add_argument("--baslik", default=None,
+                    help="sunum haritasinin basligi (rapora koyarken)")
     args = ap.parse_args()
 
     if cv2 is None:
@@ -342,6 +479,16 @@ def main():
 
     izgara = Izgara(args.boyut, args.coz)
 
+    def sunum_yaz(izg, pozlar, aciklama):
+        """Rapora konacak olculendirilmis haritayi yazar."""
+        yol = args.cikti + "_sunum.png"
+        baslik = args.baslik or ("ODA HARITASI - TEK TARAMA" if args.tek
+                                 else "ODA HARITASI - SLAM (GEZEREK)")
+        alt = (f"{aciklama}   |   hucre {args.coz*100:.0f} cm   |   "
+               f"{time.strftime('%d.%m.%Y %H:%M')}")
+        cv2.imwrite(yol, izg.sunum(pozlar, baslik=baslik, altbilgi=alt))
+        print(f"[SUNUM] {yol}  <- rapora/sunuma bunu koy")
+
     try:
         # ------------------------------------------------ TEK TARAMA
         if args.tek:
@@ -359,6 +506,8 @@ def main():
                                 izgara=izgara.izgara, coz=izgara.coz,
                                 pozlar=np.array([[0.0, 0.0, 0.0]]))
             en, boy = np.ptp(P[:, 0]), np.ptp(P[:, 1])
+            sunum_yaz(izgara, None,
+                      f"{args.ortalama} tarama ortalandi, {len(P)} nokta")
             print(f"[BITTI] {args.cikti}.png yazildi")
             print(f"        {len(P)} nokta | odanin kapladigi alan "
                   f"~{en:.2f} x {boy:.2f} m")
@@ -404,6 +553,11 @@ def main():
         np.savez_compressed(args.cikti + ".npz",
                             izgara=slam.izgara.izgara, coz=slam.izgara.coz,
                             pozlar=np.array(slam.pozlar))
+        yol_m = sum(float(np.hypot(b[0] - a[0], b[1] - a[1]))
+                    for a, b in zip(slam.pozlar, slam.pozlar[1:]))
+        sunum_yaz(slam.izgara, slam.pozlar,
+                  f"{len(slam.pozlar)} poz, {yol_m:.1f} m guzergah, "
+                  f"son eslesme %{slam.son_oran*100:.0f}")
         print(f"[BITTI] {args.cikti}.png / .npz  ({len(slam.pozlar)} poz)")
 
     except (KeyboardInterrupt, StopIteration):
@@ -413,7 +567,12 @@ def main():
     finally:
         if lid:
             lid.kapat()
-        cv2.destroyAllWindows()
+        # Ekransiz makinede (SSH / sunucu / --tek modu) GUI derlenmemis olabilir;
+        # dosyalar yazildiktan SONRA burada cokmesin.
+        try:
+            cv2.destroyAllWindows()
+        except cv2.error:
+            pass
     return 0
 
 
