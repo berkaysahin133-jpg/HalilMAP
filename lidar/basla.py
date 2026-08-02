@@ -41,7 +41,7 @@ def bekle():
 #  ADIM 0 -- dosyalar yerinde mi
 # ============================================================================
 baslik("ADIM 0/4  --  Dosyalar kontrol ediliyor")
-GEREKLI = ["c1.py", "goster.py", "harita.py", "tanila.py"]
+GEREKLI = ["c1.py", "goster.py", "harita.py", "tanila.py", "guvenlik.py"]
 eksik_dosya = [d for d in GEREKLI if not os.path.exists(os.path.join(KLASOR, d))]
 if eksik_dosya:
     print(f"  [HATA] Su dosyalar eksik: {', '.join(eksik_dosya)}")
@@ -217,7 +217,10 @@ while True:
 
    4  KAYIT AL             gez, kaydet -> sonra robotsuz tekrar incele
 
-   5  TESHIS               veri gelmiyorsa / bir sey ters giderse BUNU CALISTIR
+   5  GUVENLIK BOLGESI     robottaki ASIL gorev: onune engel girince DUR
+                           (video icin cekilecek sahne bu)
+
+   6  TESHIS               veri gelmiyorsa / bir sey ters giderse BUNU CALISTIR
 
    0  CIKIS
 """)
@@ -254,10 +257,19 @@ while True:
         print(f"  Sonra harita cikarmak icin:")
         print(f"     python harita.py --oynat {ad}.npz --slam")
     elif s == "5":
+        print("""
+  LiDAR'i aracin one bakan yuzune koy (ya da masada elinde tut).
+  Onune elini/bir kutuyu yaklastir:
+     yesil SERBEST  ->  sari YAVAS (90 cm)  ->  kirmizi DUR (40 cm)
+  Arac olculerine gore ayarlamak icin:
+     python guvenlik.py --genislik 0.6 --dur 0.4 --yavas 0.9
+""")
+        calistir("guvenlik.py")
+    elif s == "6":
         calistir("tanila.py")
     elif s == "0":
         break
     else:
-        print("  1, 2, 3, 4, 5 veya 0 yaz.")
+        print("  1, 2, 3, 4, 5, 6 veya 0 yaz.")
 
 print("\n  Bitti.")

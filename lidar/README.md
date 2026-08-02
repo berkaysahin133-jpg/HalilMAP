@@ -1,14 +1,61 @@
 # RPLIDAR C1 — başlangıç
 
 ```
-basla.py        Sıfırdan başlatan tek dosya — ne yapacağını bilmiyorsan BUNU çalıştır
-tanila.py       Teşhis — veri gelmiyorsa BUNU çalıştır, sorunu söyler
-c1.py           Bağımsız sürücü (sadece pyserial). ROS gerekmez.
-goster.py       Canlı görünüm / kayıt / oynatma / sentetik oda
-harita.py       2D harita: tek tarama + gezerek (ICP-SLAM)
-test_c1.py      Protokol testi — LİDAR OLMADAN çalışır (26 kontrol)
-test_harita.py  ICP/SLAM testi — LİDAR OLMADAN çalışır (20 kontrol)
+basla.py         Sıfırdan başlatan tek dosya — ne yapacağını bilmiyorsan BUNU çalıştır
+tanila.py        Teşhis — veri gelmiyorsa BUNU çalıştır, sorunu söyler
+c1.py            Bağımsız sürücü (sadece pyserial). ROS gerekmez.
+goster.py        Canlı görünüm / kayıt / oynatma / sentetik oda
+harita.py        2D harita: tek tarama + gezerek (ICP-SLAM)
+guvenlik.py      Güvenlik bölgesi — LiDAR'ın araç üzerindeki asıl görevi
+test_c1.py       Protokol testi — LİDAR OLMADAN çalışır (26 kontrol)
+test_harita.py   ICP/SLAM testi — LİDAR OLMADAN çalışır (20 kontrol)
+test_guvenlik.py Güvenlik bölgesi testi — LİDAR OLMADAN çalışır (31 kontrol)
 ```
+
+## LiDAR'ın araç üzerindeki görevi
+
+LiDAR bu araçta **navigasyon yapmaz** — yönü çizgi izleme, konumu QR verir.
+LiDAR'ın işi, kameranın yapamadığı şey: önündeki boşluğu metrik olarak ölçmek.
+
+```bash
+python guvenlik.py --sahte      # LiDAR olmadan dene
+python guvenlik.py              # canlı
+python guvenlik.py --genislik 0.6 --dur 0.4 --yavas 0.9
+```
+
+Aracın önünde koridor şeklinde bir bölge tanımlanır (`--genislik` = araç
+genişliği + pay). Bölgeye giren nesneye göre:
+
+| Durum | Koşul | Hız çarpanı |
+|---|---|---|
+| 🟢 SERBEST | koridor boş | ×1.0 |
+| 🟡 YAVAS | engel < 90 cm | ×0.4 |
+| 🔴 DUR | engel < 40 cm | ×0.0 |
+
+Üç tasarım kararı ve gerekçeleri:
+
+- **`min_nokta=2`** — tek gürültü noktası aracı durdurmamalı.
+- **Histerezis (12 cm)** — eşiğin tam üstünde titreyen engel, aracı sürekli
+  dur-kalk yaptırır. Çıkış eşiği giriş eşiğinden büyük. (Test: eşikte ±2 cm
+  oynayan engelde 20 karede en fazla 1 durum değişimi.)
+- **Bayat veri → YAVAS** — sensör susarsa tam hızla devam etmek en tehlikeli
+  davranıştır. 0.7 sn veri gelmezse otomatik yavaşlar.
+
+### Çizgi izleme koduna bağlamak
+
+```python
+from guvenlik import GuvenlikOkuyucu
+oku = GuvenlikOkuyucu(port="/dev/ttyUSB0")   # arka planda tarar, ana döngüyü bloklamaz
+...
+d = oku.durum()
+hiz = int(TABAN_HIZ * d["hiz_carpani"])
+if d["durum"] == "DUR":
+    duzeltme = 0                             # dururken direksiyon kırma
+```
+
+> LiDAR'ı ana döngüde okuma. Çizgi takibi ~30 Hz döner, LiDAR 10 Hz üretir;
+> `next(taramalar())` çağırırsan direksiyon LiDAR'ı beklemeye başlar.
+> `GuvenlikOkuyucu` bu yüzden ayrı iş parçacığında çalışır.
 
 ## ⚠ "Bağlanıyor ama veri gelmiyor"
 
