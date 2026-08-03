@@ -377,8 +377,31 @@ class SeriOkuyucu(_TemelOkuyucu):
             pass
 
 
+def ble_tara(sure=8.0):
+    """Yakindaki BLE cihazlarini listeler; JK BMS'leri basa alir.
+
+    MAC adresi zaten BMS'in ETIKETINDE yazar (MAC:C8:47:80:...). Bu islev
+    etiket okunamadiginda ya da dogrulamak icindir.
+    """
+    import asyncio
+    try:
+        from bleak import BleakScanner
+    except ImportError:
+        raise BmsHatasi("bleak kurulu degil:  pip install bleak")
+
+    cihazlar = asyncio.run(BleakScanner.discover(timeout=sure))
+    bulunan = [(d.address, d.name or "?") for d in cihazlar]
+    bulunan.sort(key=lambda t: 0 if (t[1] or "").upper().startswith("JK") else 1)
+    return bulunan
+
+
 class BleOkuyucu(_TemelOkuyucu):
-    """Telefon uygulamasinin kullandigi yol. `pip install bleak` gerekir."""
+    """Telefon uygulamasinin kullandigi yol. `pip install bleak` gerekir.
+
+    ONEMLI: JK BMS ayni anda TEK BLE baglantisi kabul eder. Telefondaki
+    uygulama bagliyken buradan baglanamazsin -- once uygulamayi kapat
+    (arka planda birakmak da yetmez, baglantiyi dusur).
+    """
 
     def __init__(self, adres, **kw):
         super().__init__(**kw)

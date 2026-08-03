@@ -222,13 +222,28 @@ def main():
     g.add_argument("--sahte", action="store_true",
                    help="batarya YOKKEN gercek cerceveleri oynatir")
     g.add_argument("--seri", metavar="PORT", help="RS485/TTL soketi (robotta bunu kullan)")
-    g.add_argument("--ble", metavar="ADRES", help="BLE MAC adresi (bleak gerekir)")
+    g.add_argument("--ble", metavar="ADRES",
+                   help="BLE MAC adresi -- BMS'in ETIKETINDE yazar (MAC:...)")
+    g.add_argument("--tara", action="store_true",
+                   help="yakindaki BLE cihazlarini listele ve cik")
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--surum", default="oto", choices=["oto", "24S", "32S"])
     ap.add_argument("--port", type=int, default=8770)
     ap.add_argument("--adres", default="0.0.0.0",
                     help="0.0.0.0 = agdaki diger cihazlar da gorebilir")
     args = ap.parse_args()
+
+    if args.tara:
+        print("BLE taraniyor (8 sn)...\n")
+        try:
+            for adres, ad in jk_bms.ble_tara():
+                isaret = "  <-- JK BMS olabilir" if ad.upper().startswith("JK") else ""
+                print(f"  {adres}   {ad}{isaret}")
+        except jk_bms.BmsHatasi as e:
+            print(f"  [HATA] {e}")
+            return 1
+        print("\n  Baglanmak icin:  python3 sunucu.py --ble <ADRES>")
+        return 0
 
     if args.sahte:
         print("[KAYNAK] SAHTE -- gercek cihazdan alinmis cerceveler oynatiliyor")

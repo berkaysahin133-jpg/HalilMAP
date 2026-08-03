@@ -115,8 +115,13 @@ class BmsDugumu(Node):
         m.power_supply_health = (BatteryState.POWER_SUPPLY_HEALTH_GOOD
                                  if not v["hatalar"]
                                  else BatteryState.POWER_SUPPLY_HEALTH_UNKNOWN)
-        # LiFePO4 paket; hucre gerilimi 3.2-3.3 V bandindaysa LIFE dogrudur
-        m.power_supply_technology = BatteryState.POWER_SUPPLY_TECHNOLOGY_LIFE
+        # Kimyayi hucre geriliminden anla -- sabit yazmak yanlis olur:
+        # LiFePO4 hucre 2.5-3.65 V, NCM/NMC (uclu) hucre 3.0-4.2 V bandindadir.
+        # JK BMS iki kimyayi da destekliyor, ayni kod iki pakette de dogru olsun.
+        m.power_supply_technology = (
+            BatteryState.POWER_SUPPLY_TECHNOLOGY_LIFE
+            if v["max_hucre_v"] <= 3.70
+            else BatteryState.POWER_SUPPLY_TECHNOLOGY_LION)
 
         self.yay.publish(m)
         self.yay_sicaklik.publish(Float32(data=float(v["mosfet_sicaklik_c"])))
