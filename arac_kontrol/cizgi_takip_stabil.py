@@ -179,6 +179,21 @@ turev_f = 0.0                              # [S-2]
 son_zaman = time.monotonic()               # [S-1]
 son_kaybolma_yonu = "SOL"
 
+# [K-1] KARA KUTU -- "köşede çizgiyi kaybediyor" teşhisi için.
+# Davranışa HİÇ dokunmaz, sadece dosya yazar. Sorun çözülünce ACIK=False yap.
+try:
+    from kara_kutu import KaraKutu
+    _kk = KaraKutu(acik=True)
+    print("[KARA KUTU] Açık. Çizgi kaybedilince kara_kutu/ klasörüne yazılacak.")
+except Exception as _e:                    # modül yoksa program yine çalışsın
+    print(f"[KARA KUTU] Kapalı ({_e})")
+
+    class _Yok:
+        def kare(self, *a): pass
+        def dok(self, *a): pass
+        def kapat(self): pass
+    _kk = _Yok()
+
 # Durum Makinesi Değişkenleri
 DURUM = "CIZGI_TAKIP"
 fren_zamanlayici = 0
@@ -417,6 +432,11 @@ try:
             setpoint = 80
             cv2.line(frame, (160, 0), (160, 240), (255, 0, 0), 2)
 
+            # [K-2] Kara kutu: her kareyi kaydet. Davranışı değiştirmez;
+            # çizgi kaybedildiğinde son 2 saniye diske yazılır.
+            _en_buyuk = max(contours, key=cv2.contourArea) if contours else None
+            _kk.kare(DURUM, frame_cizgi, mask, _en_buyuk)
+
             if len(contours) > 0:
                 c = max(contours, key=cv2.contourArea)
                 alan = cv2.contourArea(c)
@@ -510,6 +530,7 @@ try:
                                 (5, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
                 else:
                     print(f"[UYARI] Çizgi yetersiz! {son_kaybolma_yonu} yönünde arama başlıyor...")
+                    _kk.dok("cizgi_yetersiz")      # [K-3]
                     DURUM = "KURTARMA_MODU"
                     kurtarma_zamanlayici = su_an
                     son_hata = 0
@@ -517,6 +538,7 @@ try:
                     turev_f = 0.0          # [S-2]
             else:
                 print(f"[UYARI] Çizgi kaybedildi! {son_kaybolma_yonu} yönünde arama başlıyor...")
+                _kk.dok("cizgi_kayip")             # [K-3]
                 DURUM = "KURTARMA_MODU"
                 kurtarma_zamanlayici = su_an
                 son_hata = 0
@@ -616,4 +638,5 @@ finally:
     cap.release()
     cv2.destroyAllWindows()
     arduino.close()
+    _kk.kapat()                            # [K-4] kara kutu kaydını kapat
     print("[SİSTEM] Güvenli çıkış yapıldı.")
