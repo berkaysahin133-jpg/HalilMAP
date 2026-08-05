@@ -29,12 +29,34 @@ echo "  mimari : $(uname -m)"
 if [ -f /etc/os-release ]; then . /etc/os-release; echo "  sistem : $PRETTY_NAME"; fi
 echo "  disk   : $(df -h / | awk 'NR==2{print $4}') bos"
 
-if ! command -v curl >/dev/null 2>&1; then
-    bilgi "curl kuruluyor (sudo sifresi istenebilir)"
-    sudo apt-get update -qq && sudo apt-get install -y curl || {
-        hata "curl kurulamadi -- internet baglantisini kontrol et"; exit 1; }
+# Yarim kalmis bir dpkg islemi APT'yi tamamen kilitler:
+#   "dpkg was interrupted, you must manually run 'sudo dpkg --configure -a'"
+# Bu durumda hicbir paket kurulamaz, once onu duzelt.
+if ! sudo dpkg --audit >/dev/null 2>&1 || \
+   sudo apt-get check 2>&1 | grep -qi "dpkg was interrupted"; then
+    uyari "yarim kalmis paket kurulumu bulundu -> onariliyor"
+    sudo dpkg --configure -a || uyari "dpkg onarimi tam bitmedi, devam ediliyor"
 fi
-ok "curl hazir"
+
+# NOT: 'Ignoring file ...list.save ... invalid filename extension' satirlari
+# HATA DEGIL. APT, .list disi uzantili dosyalari gormezden gelir; dogru davranis.
+
+if ! command -v curl >/dev/null 2>&1; then
+    if command -v wget >/dev/null 2>&1; then
+        bilgi "curl yok ama wget var -- wget kullanilacak"
+        INDIR="wget -qO-"
+    else
+        bilgi "curl kuruluyor (sudo sifresi istenebilir)"
+        sudo apt-get update -qq && sudo apt-get install -y curl || {
+            hata "curl kurulamadi. Once sunu calistir:  sudo dpkg --configure -a"
+            hata "sonra:  sudo apt update && sudo apt install -y curl"
+            exit 1; }
+        INDIR="curl -fsSL"
+    fi
+else
+    INDIR="curl -fsSL"
+fi
+ok "indirme araci: ${INDIR%% *}"
 
 # -----------------------------------------------------------------------------
 basli "2/3  Claude Code"
@@ -43,7 +65,7 @@ if command -v claude >/dev/null 2>&1; then
     ok "zaten kurulu: $(claude --version 2>/dev/null || echo '?')"
 else
     bilgi "resmi kurulum betigi deneniyor (bagimsiz ikili, Node gerekmez)"
-    if curl -fsSL https://claude.ai/install.sh | bash; then
+    if $INDIR https://claude.ai/install.sh | bash; then
         ok "kuruldu"
     else
         uyari "olmadi -> npm yoluna geciliyor"
@@ -52,7 +74,7 @@ else
         if ! command -v node >/dev/null 2>&1 || \
            [ "$(node -v 2>/dev/null | sed 's/v\([0-9]*\).*/\1/')" -lt 18 ] 2>/dev/null; then
             bilgi "Node.js 20 kuruluyor (nvm)"
-            curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash
+            $INDIR https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash
             export NVM_DIR="$HOME/.nvm"
             # shellcheck disable=SC1091
             [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
