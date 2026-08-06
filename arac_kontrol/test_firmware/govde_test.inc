@@ -14,8 +14,8 @@
  *   - Slew-rate limiter (akim sicramasi / patinaj engelleyici)
  */
 
-#include <Wire.h>
-#include <Adafruit_MCP4725.h>
+
+
 
 Adafruit_MCP4725 dacSol, dacSag;
 
