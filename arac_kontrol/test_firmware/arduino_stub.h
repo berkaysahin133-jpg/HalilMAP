@@ -23,6 +23,8 @@ struct _Serial {
   void print(unsigned int) {}
   void print(int) {}
   void print(unsigned long) {}
+  void print(long) {}
+  void println(long) {}
   void println(const char*) {}
   void println(unsigned int) {}
   void println(int) {}
@@ -35,3 +37,12 @@ struct Adafruit_MCP4725 {
 #include <cstring>
 #include <cstdlib>
 #define constrain(v,lo,hi) ((v)<(lo)?(lo):((v)>(hi)?(hi):(v)))
+
+// --- kesme / zaman taklidi (enkoder testi icin) ---
+#define CHANGE 1
+static unsigned long _us = 0;
+unsigned long micros() { return _us; }
+int  digitalPinToInterrupt(uint8_t p) { return p; }
+void attachInterrupt(int, void (*)(), int) {}
+void noInterrupts() {}
+void interrupts() {}

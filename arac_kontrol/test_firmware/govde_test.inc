@@ -53,7 +53,37 @@ const uint16_t ACIL_NOTR_MS = 300;    // birakildiktan sonra bu kadar notr bekle
 // A secenegi (NO kontak -> GND): true  -- dahili cekme direnci gerekli
 // B secenegi (gerilim bolucu) : false -- bolucu zaten seviyeyi belirliyor
 const bool     ACIL_PULLUP  = true;
-                                      // 900 count'luk komut ~65 ms'de oturur
+
+// ---------------- ENKODER (Kelly "Meter" pini) ----------------
+// Kelly KLS-S kilavuzu, bolum 3.2.1, DJ7091Y-2.3-21 konnektoru:
+//     (8) Meter: Copy signal of hall sensors.   -- KOYU GRI kablo
+// Motorun hall soketine DOKUNMADAN, gaz konnektorundeki koyu gri telden tek
+// hall fazinin sinyali okunur.
+//
+// BAGLANTI:
+//     SOL  Kelly pin 8 (koyu gri) -> D2      <- kesme pini
+//     SAG  Kelly pin 8 (koyu gri) -> D3      <- kesme pini
+//     Kelly pin 20 (RTN, siyah)   -> Arduino GND
+//
+//   DIKKAT: (15) Micro_SW "Gray", (8) Meter "Dark Gray". Renge guvenme --
+//   tekerlegi elle cevirip multimetreyle oynayan teli bul.
+//   5 V ustu olcersen dogrudan bagLAMA: 10k/4k7 gerilim bolucu koy.
+//
+// BEKLENEN: hoverboard hub motoru 15 kutup cifti, Meter tek faz kopyalar
+//   -> elektriksel turda 2 kenar -> TUR BASINA ~30 kenar
+//   -> 6.5 inc tekerde (518 mm cevre) ~17 mm/darbe, ~2.5 derece pivot
+//
+// GURULTU SUZGECI: 17.3 mm/darbe oldugu icin 10 m/s de bile darbeler 1727 us
+// aralikli gelir. 500 us esik, gercek darbeye 3.5x pay birakirken 2 kHz ustu
+// gurultuyu tamamen eler. (40 us denenmisti: gurultuyu ELEMIYOR, sadece
+// 40 us de bire seyreltiyor -- test bunu yakaladi.)
+//
+// YON: Meter tek faz oldugu icin yon BILGISI YOK. Yonu biz biliyoruz --
+// DAC'a yazdigimiz degerin isareti. NOTR'un altinda ileri, ustunde geri.
+const uint8_t  ENK_SOL_PIN  = 2;      // 0 = enkoder kullanma
+const uint8_t  ENK_SAG_PIN  = 3;
+const uint16_t ENK_MIN_US   = 500;   // gurultu suzgeci -- asagidaki hesaba bak
+const uint16_t ENK_YON_BANT = 30;     // NOTR yakininda son yonu koru
 // -----------------------------------------
 
 char    buf[16];
@@ -120,6 +150,36 @@ bool          acilKilit    = true;    // acilista KILITLI basla (guvenli taraf)
 unsigned long acilBirakMs  = 0;       // ne zaman birakildi
 bool          piNotrde     = true;    // Pi'nin gonderdigi son komut notr mu
 
+// ---------------- Enkoder durumu ----------------
+volatile long          enkSol = 0,        enkSag = 0;        // ISARETLI sayim
+volatile unsigned long enkSonSolUs = 0,   enkSonSagUs = 0;
+volatile int8_t        enkYonSol = 1,     enkYonSag = 1;     // +1 ileri, -1 geri
+volatile unsigned int  enkElenen = 0;                        // gurultu sayaci
+
+// Kesme yordamlari. Faz kablolarinin yanindan gecen hatlarda ani gurultu
+// darbeleri olur; ENK_MIN_US'ten kisa araliklari saymiyoruz.
+void enkISRSol() {
+  unsigned long t = micros();
+  if (t - enkSonSolUs < ENK_MIN_US) { enkElenen++; return; }
+  enkSonSolUs = t;
+  enkSol += enkYonSol;
+}
+
+void enkISRSag() {
+  unsigned long t = micros();
+  if (t - enkSonSagUs < ENK_MIN_US) { enkElenen++; return; }
+  enkSonSagUs = t;
+  enkSag += enkYonSag;
+}
+
+// Komut isaretinden yon. NOTR civarinda tekerlek serbest doner (kayis),
+// o yuzden son yonu koruyoruz -- sifirlarsak yavaslarken sayim durur.
+int8_t enkYonHesapla(uint16_t anlik, int8_t onceki) {
+  if ((long)anlik + ENK_YON_BANT < (long)NOTR) return  1;   // ileri
+  if ((long)anlik > (long)NOTR + ENK_YON_BANT) return -1;   // geri
+  return onceki;
+}
+
 // Buton basili mi? Titremeye karsi 2 ardisik okuma.
 bool acilOku() {
   if (ACIL_PIN == 0) return false;
@@ -135,6 +195,16 @@ void setup() {
   Serial.setTimeout(20);          // her ihtimale karsi
 
   if (ACIL_PIN != 0) pinMode(ACIL_PIN, ACIL_PULLUP ? INPUT_PULLUP : INPUT);
+
+  // Meter cikisi acik kolektorlu olabilir -> cekme direnci gerekli.
+  if (ENK_SOL_PIN != 0) {
+    pinMode(ENK_SOL_PIN, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(ENK_SOL_PIN), enkISRSol, CHANGE);
+  }
+  if (ENK_SAG_PIN != 0) {
+    pinMode(ENK_SAG_PIN, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(ENK_SAG_PIN), enkISRSag, CHANGE);
+  }
 
   Wire.begin();
   Wire.setClock(400000);          // 100k -> 400k, DAC yazimi ~yari sure
@@ -190,6 +260,10 @@ void loop() {
     }
   }
 
+  // --- 1c) Enkoder yon isareti: DAC komutunun isaretinden ---
+  enkYonSol = enkYonHesapla(anlikSol, enkYonSol);
+  enkYonSag = enkYonHesapla(anlikSag, enkYonSag);
+
   if (acilKilit && (anlikSol != NOTR || anlikSag != NOTR)) {
     anlikSol = anlikSag = NOTR;            // hedef* DEGISTIRILMEZ
     dacYaz(NOTR, NOTR);                    // sadece degisince yaz, I2C'yi bogma
@@ -230,11 +304,23 @@ void loop() {
   // --- 4) Heartbeat: Pi bagli mi, hangi degerdeyiz ---
   if (simdi - sonHeartbeatMs > HEARTBEAT_MS) {
     sonHeartbeatMs = simdi;
+    // long 4 bayt, AVR'de tek islemde okunmaz -> kesmeleri kisa sure kapat
+    noInterrupts();
+    long eSol = enkSol, eSag = enkSag;
+    unsigned int eGur = enkElenen;
+    interrupts();
+
     Serial.print("OK,");
     Serial.print(anlikSol);
     Serial.print(",");
     Serial.print(anlikSag);
     Serial.print(",");
-    Serial.println(acilBasili ? "ACIL" : (acilKilit ? "KILIT" : "HAZIR"));
+    Serial.print(acilBasili ? "ACIL" : (acilKilit ? "KILIT" : "HAZIR"));
+    Serial.print(",");
+    Serial.print(eSol);
+    Serial.print(",");
+    Serial.print(eSag);
+    Serial.print(",");
+    Serial.println(eGur);
   }
 }

@@ -8,3 +8,6 @@ sed 's|#include <Wire.h>||; s|#include <Adafruit_MCP4725.h>||' \
     "$D/../arduino_dac_surucu.ino" > "$D/govde_test.inc"
 g++ -std=c++17 -w -I"$D" -o "$D/acil" "$D/acil_test.cpp"
 "$D/acil"
+
+g++ -std=c++17 -w -I"$D" -o "$D/enk" "$D/enkoder_test.cpp"
+"$D/enk"
