@@ -81,12 +81,24 @@ const bool     ACIL_PULLUP  = true;
 //     Sinyali TERSLER; kenar saydigimiz icin (CHANGE) sonuc degismez.
 //     Bu secenekte ENK_PULLUP = true (cikis acik kolektor).
 //
-//   ALTERNATIF (lehimle): gerilim bolucu + zener
+//   EN BASIT (tek direnc): 10k SERI + AVR'nin dahili kenetleme diyodu
+//       Kelly pin 8 --[10k]--> D2 / D3
+//     Pin gerilimi 5.0 V'ta kenetlenir; direnc akimi sinirlar:
+//         6 V  -> (6-5.6)/10k  =  40 uA
+//         12 V -> (12-5.6)/10k = 640 uA
+//     AVR icin guvenli sinir ~1 mA, ikisi de cok altinda. Boylece Meter
+//     cikisi 6 V da olsa 12 V da olsa AYNI direnc calisir -- olcum
+//     belirsizligi tamamen ortadan kalkar.
+//     Bu secenekte ENK_PULLUP = false.
+//
+//   ALTERNATIF (iki direnc): gerilim bolucu + zener
 //       Meter --[4k7]--+--[10k]-- GND
 //                      +-- 5.1 V zener --> GND
 //                      +-- D2 / D3
-//     6 V  -> 4.08 V,  12 V -> zener 5.1 V'ta kirpar.
-//     Bu secenekte ENK_PULLUP = false.
+//     6 V -> 4.08 V,  12 V -> zener 5.1 V'ta kirpar.
+//     Bu secenekte de ENK_PULLUP = false.
+//     DIKKAT: iki direnc ESIT olursa 3.0 V cikar; AVR'nin HIGH esigi tam
+//     3.0 V'tur (0.6 x VCC) -- kararsiz okur, kullanma.
 //
 //   NOT: Multimetre kare dalganin ORTALAMASINI okur; donen tekerlekte
 //   0-12 V'luk sinyal 6 V gorunur. Optokuplor bu belirsizligi tamamen
@@ -107,9 +119,9 @@ const uint8_t  ENK_SOL_PIN  = 2;      // 0 = enkoder kullanma
 const uint8_t  ENK_SAG_PIN  = 3;
 const uint16_t ENK_MIN_US   = 500;   // gurultu suzgeci -- asagidaki hesaba bak
 const uint16_t ENK_YON_BANT = 30;     // NOTR yakininda son yonu koru
-// Optokuplor modulu ya da acik kolektor cikis -> true
-// Harici gerilim bolucu -> false (dahili direnc bolucuyle cakisir)
-const bool     ENK_PULLUP   = true;
+// Tek seri direnc ya da gerilim bolucu -> false  (SU AN BU)
+// Optokuplor modulu -> true (cikisi acik kolektor)
+const bool     ENK_PULLUP   = false;
 // -----------------------------------------
 
 char    buf[16];
