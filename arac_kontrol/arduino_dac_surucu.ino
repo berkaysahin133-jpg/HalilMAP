@@ -68,17 +68,29 @@ const bool     ACIL_PULLUP  = true;
 //   DIKKAT: (15) Micro_SW "Gray", (8) Meter "Dark Gray". Renge guvenme --
 //   tekerlegi elle cevirip multimetreyle oynayan teli bul.
 //
-// SEVIYE UYARLAMA -- Meter cikisi 5 V'tan yuksekse (olculen: 6 V):
-//     Meter --[4k7]--+--[10k]-- GND
-//                    |
-//                    +--||-- 5.1 V zener --> GND   (koruma)
-//                    |
-//                    +-- D2 / D3
-//   6 V girisde  -> 4.08 V (5 V mantik icin saglam HIGH)
-//   12 V girisde -> zener 5.1 V'ta kirpar, pin yanmaz
-//   Multimetre kare dalganin ORTALAMASINI okur: donen tekerlekte 0-12 V'luk
-//   sinyal 6 V gorunur. Bu bolucu iki ihtimali de karsilar.
-//   Harici bolucu kullanirken ENK_PULLUP = false yap.
+// SEVIYE UYARLAMA -- Meter cikisi 5 V ustundeyse (olculen: 6 V)
+//
+//   TAVSIYE EDILEN: 4 kanal OPTOKUPLOR IZOLASYON MODULU (PC817 / TLP281)
+//       Kelly pin 8  -> modul IN1 / IN2
+//       Kelly pin 20 -> modul GND (giris tarafi)
+//       modul OUT1/OUT2 -> D2 / D3
+//       modul VCC/GND   -> Arduino 5V / GND (cikis tarafi)
+//     Girisi 3.3-24 V kabul eder, seviye belirsizligi dert olmaz. Ustelik
+//     Kelly ile Arduino'yu ELEKTRIKSEL OLARAK AYIRIR -- motor gurultusu
+//     gecmez, surucude ariza olursa Arduino korunur.
+//     Sinyali TERSLER; kenar saydigimiz icin (CHANGE) sonuc degismez.
+//     Bu secenekte ENK_PULLUP = true (cikis acik kolektor).
+//
+//   ALTERNATIF (lehimle): gerilim bolucu + zener
+//       Meter --[4k7]--+--[10k]-- GND
+//                      +-- 5.1 V zener --> GND
+//                      +-- D2 / D3
+//     6 V  -> 4.08 V,  12 V -> zener 5.1 V'ta kirpar.
+//     Bu secenekte ENK_PULLUP = false.
+//
+//   NOT: Multimetre kare dalganin ORTALAMASINI okur; donen tekerlekte
+//   0-12 V'luk sinyal 6 V gorunur. Optokuplor bu belirsizligi tamamen
+//   ortadan kaldirdigi icin tercih sebebidir.
 //
 // BEKLENEN: hoverboard hub motoru 15 kutup cifti, Meter tek faz kopyalar
 //   -> elektriksel turda 2 kenar -> TUR BASINA ~30 kenar
@@ -95,9 +107,9 @@ const uint8_t  ENK_SOL_PIN  = 2;      // 0 = enkoder kullanma
 const uint8_t  ENK_SAG_PIN  = 3;
 const uint16_t ENK_MIN_US   = 500;   // gurultu suzgeci -- asagidaki hesaba bak
 const uint16_t ENK_YON_BANT = 30;     // NOTR yakininda son yonu koru
-// Harici gerilim bolucu kullaniyorsan false: dahili cekme direnci bolucuyle
-// cakisir. Dogrudan (acik kolektor) bagliyorsan true.
-const bool     ENK_PULLUP   = false;
+// Optokuplor modulu ya da acik kolektor cikis -> true
+// Harici gerilim bolucu -> false (dahili direnc bolucuyle cakisir)
+const bool     ENK_PULLUP   = true;
 // -----------------------------------------
 
 char    buf[16];
