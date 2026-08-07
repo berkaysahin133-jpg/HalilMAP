@@ -67,7 +67,18 @@ const bool     ACIL_PULLUP  = true;
 //
 //   DIKKAT: (15) Micro_SW "Gray", (8) Meter "Dark Gray". Renge guvenme --
 //   tekerlegi elle cevirip multimetreyle oynayan teli bul.
-//   5 V ustu olcersen dogrudan bagLAMA: 10k/4k7 gerilim bolucu koy.
+//
+// SEVIYE UYARLAMA -- Meter cikisi 5 V'tan yuksekse (olculen: 6 V):
+//     Meter --[4k7]--+--[10k]-- GND
+//                    |
+//                    +--||-- 5.1 V zener --> GND   (koruma)
+//                    |
+//                    +-- D2 / D3
+//   6 V girisde  -> 4.08 V (5 V mantik icin saglam HIGH)
+//   12 V girisde -> zener 5.1 V'ta kirpar, pin yanmaz
+//   Multimetre kare dalganin ORTALAMASINI okur: donen tekerlekte 0-12 V'luk
+//   sinyal 6 V gorunur. Bu bolucu iki ihtimali de karsilar.
+//   Harici bolucu kullanirken ENK_PULLUP = false yap.
 //
 // BEKLENEN: hoverboard hub motoru 15 kutup cifti, Meter tek faz kopyalar
 //   -> elektriksel turda 2 kenar -> TUR BASINA ~30 kenar
@@ -84,6 +95,9 @@ const uint8_t  ENK_SOL_PIN  = 2;      // 0 = enkoder kullanma
 const uint8_t  ENK_SAG_PIN  = 3;
 const uint16_t ENK_MIN_US   = 500;   // gurultu suzgeci -- asagidaki hesaba bak
 const uint16_t ENK_YON_BANT = 30;     // NOTR yakininda son yonu koru
+// Harici gerilim bolucu kullaniyorsan false: dahili cekme direnci bolucuyle
+// cakisir. Dogrudan (acik kolektor) bagliyorsan true.
+const bool     ENK_PULLUP   = false;
 // -----------------------------------------
 
 char    buf[16];
@@ -198,11 +212,11 @@ void setup() {
 
   // Meter cikisi acik kolektorlu olabilir -> cekme direnci gerekli.
   if (ENK_SOL_PIN != 0) {
-    pinMode(ENK_SOL_PIN, INPUT_PULLUP);
+    pinMode(ENK_SOL_PIN, ENK_PULLUP ? INPUT_PULLUP : INPUT);
     attachInterrupt(digitalPinToInterrupt(ENK_SOL_PIN), enkISRSol, CHANGE);
   }
   if (ENK_SAG_PIN != 0) {
-    pinMode(ENK_SAG_PIN, INPUT_PULLUP);
+    pinMode(ENK_SAG_PIN, ENK_PULLUP ? INPUT_PULLUP : INPUT);
     attachInterrupt(digitalPinToInterrupt(ENK_SAG_PIN), enkISRSag, CHANGE);
   }
 
