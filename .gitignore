@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+konfig.json
+kayitlar/
+telemetri.csv
+
+# Excel rapor uretimi sirasinda olusan olceklenmis kopyalar
+rapor/gorseller/*_x[0-9]*.png
